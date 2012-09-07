@@ -1,5 +1,5 @@
 {-# LANGUAGE TypeFamilies, DeriveDataTypeable #-}
-module Eclaire.Frontend.Base where
+module Eclair.Frontend.Base where
 
 import Control.Applicative
 import Control.Concurrent

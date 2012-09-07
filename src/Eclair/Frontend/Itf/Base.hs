@@ -1,7 +1,7 @@
 {-# LANGUAGE TypeFamilies #-}
-module Eclaire.Frontend.Itf.Base where
+module Eclair.Frontend.Itf.Base where
 
-import Eclaire.Frontend.Base
+import Eclair.Frontend.Base
 
 
 -- * Common interfaces to objects
