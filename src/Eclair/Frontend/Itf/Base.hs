@@ -1,7 +1,17 @@
-{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeFamilies, FlexibleInstances, UndecidableInstances #-}
 module Eclair.Frontend.Itf.Base where
 
 import Eclair.Frontend.Base
+
+
+-- | Variant of @IsRoot@ that has a purely functional merging
+--   function.
+class IsRootPure o where
+  joinRootsPure :: o -> o -> o
+
+-- | Automatic conversion of a pure root into a conventional root.
+instance IsRootPure o => IsRoot o where
+  joinRoots p q = return $ joinRootsPure p q
 
 
 -- * Common interfaces to objects
@@ -30,5 +40,5 @@ class IsObj o => HasWrap o where
 
   wrap' :: (IsStore s, ObjStore o ~ s) => Maybe (Snap s) -> Ctx s -> ObjType o -> Obj o
 
--- class (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
--- instance (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
+class (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
+instance (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
