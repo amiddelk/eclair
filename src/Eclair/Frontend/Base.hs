@@ -55,6 +55,9 @@ class IsStore s where
   createSnapshot    :: s -> Trans s -> Maybe (Snap s) -> IO (Snap s)
   disposeSnapshot   :: s -> Trans s -> Snap s -> IO ()
 
+  publishSpace      :: s -> Trans s -> Snap s -> Maybe (Ref s o) -> o -> (Ref s o -> IO ()) -> IO ()
+  accessSpace       :: s -> Trans s -> Snap s -> Ref s o -> (o -> IO ()) -> IO ()
+
   -- | A handler that is called prior restarting a transaction. As
   --   transactions are pure, a restart can only have a different
   --   outcome when the store is modified in between. This handler
@@ -96,20 +99,6 @@ data Obj o = Obj
   , objSnap  :: !(Snap (ObjStore o))
   }
 
-
-  {-
--- | The operations of @Backend c t@ implement the backend operations
---   for an object @Obj c t@ in a store @c@.
---   Results are delivered via the continuation
---   function that is passed as parameter, which permits operations to
---   fork off a computation that computes the final results concurrently.
---   A single exception is the merge operation, as its execution may
---   force evaluation of the object state and therefore drive fetches
---   to take place.
-  createObj :: Ctx c -> Obj c t -> ((Ref c t) -> IO ()) -> IO ()
-  fetchObj  :: Ctx c -> Ref c t -> ((Obj c t) -> IO ()) -> IO ()
-  mergeObj  :: Ctx c -> Ref c t -> Obj c t -> IO ()
-  -}
 
 -- * The toplevel function.
 
@@ -158,7 +147,7 @@ disposeSnapshots ctx = do
 -- | Creates a new snapshot in the transaction and makes it the current.
 --   Non-current transactions are disposed when no objects refer to it
 --   anymore, or at the latest at the end of the transaction.
-pushSnapshot :: IsStore s => Ctx s -> IO ()
+pushSnapshot :: IsStore s => Ctx s -> IO (Snap s)
 pushSnapshot ctx = do
   let store = ctxStore ctx
   let trans = ctxTrans ctx
@@ -172,6 +161,7 @@ pushSnapshot ctx = do
     snaps <- readIORef varSnaps
     let snaps' = w : snaps
     writeIORef varSnaps $! snaps'
+    return snap
 
 -- | Runs the transaction, thereby producing commands (internal function).
 produce :: NFData a => MVar a -> Ctx s -> TransactM s a -> IO ()
@@ -230,6 +220,13 @@ onBackend ctx f = do
   writeChan (ctxChan ctx) (CommDo comm)
   takeMVar var
 
+wrapObj :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Snap s -> o -> Obj o
+wrapObj ctx snap o = Obj
+  { objValue = o
+  , objCtx   = ctx
+  , objSnap  = snap
+  }
+
 
 -- * Operations in the transaction monad
 
@@ -241,8 +238,14 @@ getCtx = TransactM ask
 --   given memory space or creates a new one. It returns the
 --   reference to the memory space.
 publish :: (IsStore s, IsObj o, s ~ ObjStore o) => Maybe (Ref s o) -> Obj o -> TransactM s (Ref s o)
-publish mbRef obj = TransactM $ do
-  return undefined
+publish mbRef obj =
+  let ctx   = objCtx obj
+      snap  = objSnap obj
+      val   = objValue obj
+      store = ctxStore ctx
+      trans = ctxTrans ctx
+  in TransactM $ liftIO $ onBackend ctx $
+       publishSpace store trans snap mbRef val
 
 -- | Creates a new memory space with the given object as root.
 create :: (IsStore s, IsObj o, s ~ ObjStore o) => Obj o -> TransactM s (Ref s o)
@@ -255,6 +258,11 @@ update ref = void . publish (Just ref)
 -- | In the current transaction, creates a (local) snapshot and opens the
 --   referenced space in it, giving the object that forms the root of its
 --   contents.
-snapshot :: (IsStore s, IsObj o, s ~ ObjStore o) => Ref s o -> TransactM s o
+snapshot :: (IsStore s, IsObj o, s ~ ObjStore o) => Ref s o -> TransactM s (Obj o)
 snapshot ref = TransactM $ do
-  return undefined
+  ctx <- ask
+  liftIO $ onBackend ctx $ \k -> do
+    snap <- pushSnapshot ctx
+    let store = ctxStore ctx
+        trans = ctxTrans ctx
+    accessSpace store trans snap ref (k . wrapObj ctx snap)
