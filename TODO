@@ -1,0 +1,7 @@
+* implement a reference store (in-memory)
+* define more interfaces (Eclair.Frontend.Itf) for functions that can be applied to
+  certain data structures.
+* implement a full-blown replicated store
+* implement the interface for the various data types for various stores
+* make examples
+* make tests
