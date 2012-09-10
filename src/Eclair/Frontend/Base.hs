@@ -42,7 +42,15 @@ instance Applicative (TransactM s) where
 
 -- * The store.
 
--- | A store of type s.
+-- | A store of type s. This class defines the interface of the store, and
+--   key concepts such as transactions and snapshots. 
+--   The store contains memory spaces: such a space is a mutable container
+--   of pure objects. A space is identified by a @Ref@, which is needed for
+--   accessing and updating the space.
+--   A transaction @Trans@ represents a unit of accesses and updates of the spaces
+--   in the store. When a space is accessed to obtain its contents, a snapshot
+--   @Snap@ is created inside the transaction in which the pure objects reside
+--   (accessible only by the transaction).
 class IsStore s where
   type Trans s :: *
   type Snap s :: *
@@ -67,7 +75,8 @@ class IsStore s where
 
 
 -- | A context is a handle to a store, a transaction,
---   and snapshots created in the transaction.
+--   and snapshots created in the transaction. The snapshots in
+--   @ctxSnaps@ are in newest-first order.
 --
 --   A contexts provides a queue for commands to execute
 --   on the store. These commands may be side-effectful
@@ -75,6 +84,11 @@ class IsStore s where
 --   pure code must either preserve referential transparancy
 --   (e.g. reading from the store) or throw a retry or unhandled
 --   exception.
+--
+--   Note: @ctxSnap@ is a reference to the latest snapshot. This
+--   may not be the snapshot in which some object was created
+--   at the time an operation on it is evaluated. The @objSnap@
+--   field of an @Obj@ points to the right snapshot instead.
 data Ctx s = Ctx
   { ctxStore   :: s
   , ctxTrans   :: Trans s
