@@ -42,3 +42,6 @@ class IsObj o => HasWrap o where
 
 class (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
 instance (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
+
+class IsObj o => HasIncr o where
+  incr :: (IsStore s, ObjStore o ~ s) => Obj o -> Obj o
