@@ -91,9 +91,9 @@ class IsStore s where
   -- | Stores the object @o@ (in the given snapshot) as root in the space identified by the reference.
   storeSpace        :: IsRoot o => s -> Trans s -> Snap s -> Ref s o -> o -> (() -> IO ()) -> IO ()
 
-  -- | A handler that is called prior restarting a transaction. As
+  -- | A handler that is called prior to restarting a transaction. Because
   --   transactions are pure, a restart can only have a different
-  --   outcome when the store is modified in between. This handler
+  --   outcome when the store has been modified in the mean time. This handler
   --   can e.g. be used to let the caller wait until the store is
   --   changed in the background.
   onTransactionRestart :: s -> IO ()
@@ -118,7 +118,7 @@ class IsStore s where
 data Ctx s = Ctx
   { ctxStore   :: s
   , ctxTrans   :: Trans s
-  , ctxSnap    :: !( IORef (Maybe (Snap s)) )
+  , ctxSnap    :: !( IORef (Snap s) )
   , ctxSnaps   :: !( IORef [Weak (Snap s)] )
   , ctxChan    :: !( Chan StoreCommand )
   }
@@ -127,7 +127,7 @@ data Ctx s = Ctx
 -- | A special class of objects that are roots of a space.
 --   These roots must be a commutative semi-monoid (or a
 --   commutative semi-group). The joining operation may use
---   side effect (it's in the IO monad).
+--   side effects (it's in the IO monad).
 class IsRoot o where
   -- | Merges the contents of two spaces.
   joinRoots :: o -> o -> IO o
@@ -141,7 +141,7 @@ class IsObj o where
 
 -- | Wrapper around an object @o@ that stores some information
 --   about the underlying object @o@, such as the snapshot from
---   which @o@ comes from.
+--   which @o@ stems from.
 data Obj o = Obj
   { objValue :: !o
   , objCtx   :: !(Ctx (ObjStore o))
@@ -151,34 +151,36 @@ data Obj o = Obj
 
 -- * The toplevel function.
 
--- | This exception can be thrown to force the transaction
---   to restart, in either the pure or monadic code.
+-- | This exception can be thrown to force the restart of a transaction,
+--   in either the pure or monadic code.
 data TransactionRestart = RequireRestart
   deriving (Eq, Show, Typeable)
 
 instance Exception TransactionRestart
 
 -- | @transactionally s f@ exposes the operations on @s@ to @f@, which
--- are run in the tran monad. The transaction gives access to a lazy
--- snapshot of the storage. To prevent the result value @a@ to refer
--- to a unevaluated part of the snapshot, the result is evaluated to
+-- are run in the @TransactM@ monad. The transaction gives access to lazily created
+-- snapshots of the store. To prevent the result value @a@ to refer
+-- to an unevaluated part of a snapshot, the result is evaluated to
 -- normal form before closing the transaction, hence the requirement on
 -- @NFData@.
 transactionally :: (NFData a, IsStore s) => s -> TransactM s a -> IO a
-transactionally store m = loop where
+transactionally store txn = loop where
   loop = handle (\RequireRestart -> onTransactionRestart store >> loop) step
-  step = bracketOnError (openTransaction store) (abortTransaction store) $ \trans -> do
-    chan  <- newChan
-    snaps <- newIORef []
-    snap  <- newIORef Nothing
+  step = bracketOnError (openTransaction store) (abortTransaction store) $ \trans ->
+    bracketOnError (createSnapshot store trans Nothing) (disposeSnapshot store trans) $ \snap -> do
+    chan     <- newChan
+    snapVar  <- newIORef snap
+    snapRef  <- createSnapRef store trans snap chan
+    snapsVar <- newIORef [snapRef]
     let ctx = Ctx { ctxStore = store, ctxTrans = trans
-                  , ctxSnap = snap, ctxSnaps = snaps
+                  , ctxSnap = snapVar, ctxSnaps = snapsVar
                   , ctxChan = chan }
-    var <- newEmptyMVar
+    result <- newEmptyMVar
     flip finally (disposeSnapshots ctx >> consumeCleanup chan) $
-      bracketOnError (forkIO $ produce var ctx m) killThread $ \_ -> do
+      bracketOnError (forkIO $ produce result ctx txn) killThread $ \_ -> do
         consume chan
-        res <- takeMVar var
+        res <- takeMVar result
         commitTransaction store trans
         return res
 
@@ -191,26 +193,29 @@ disposeSnapshots ctx = do
   let trans = ctxTrans ctx
   forM_ snaps finalize
   writeIORef (ctxSnaps ctx) []
-  writeIORef (ctxSnap ctx) Nothing
 
 -- | Creates a new snapshot in the transaction and makes it the current.
 --   Non-current transactions are disposed when no objects refer to it
 --   anymore, or at the latest at the end of the transaction.
 pushSnapshot :: IsStore s => Ctx s -> IO (Snap s)
 pushSnapshot ctx = do
-  let store = ctxStore ctx
-  let trans = ctxTrans ctx
-  let varSnap = ctxSnap ctx
-  let chan = ctxChan ctx
-  mbSnap <- readIORef varSnap
-  bracketOnError (createSnapshot store trans mbSnap) (disposeSnapshot store trans) $ \snap -> do
-    writeIORef varSnap $! Just snap
-    w <- mkWeakPtr snap $ Just $ writeChan chan $! CommCleanup $ disposeSnapshot store trans snap
-    let varSnaps = ctxSnaps ctx
-    snaps <- readIORef varSnaps
+  let store   = ctxStore ctx
+      trans   = ctxTrans ctx
+      snapVar = ctxSnap ctx
+      chan    = ctxChan ctx
+  prevSnap <- readIORef snapVar
+  bracketOnError (createSnapshot store trans $ Just prevSnap) (disposeSnapshot store trans) $ \snap -> do
+    writeIORef snapVar $! snap
+    w <- createSnapRef store trans snap chan
+    let snapsVar = ctxSnaps ctx
+    snaps <- readIORef snapsVar
     let snaps' = w : snaps
-    writeIORef varSnaps $! snaps'
+    writeIORef snapsVar $! snaps'
     return snap
+
+createSnapRef :: IsStore s => s -> Trans s -> Snap s -> Chan StoreCommand -> IO (Weak (Snap s))
+createSnapRef store trans snap chan = 
+  mkWeakPtr snap $ Just $ writeChan chan $! CommCleanup $ disposeSnapshot store trans snap
 
 -- | Runs the transaction, thereby producing commands (internal function).
 produce :: NFData a => MVar a -> Ctx s -> TransactM s a -> IO ()
@@ -258,12 +263,12 @@ onBackendPure :: Ctx s -> ( (a -> IO ()) -> IO () ) -> a
 onBackendPure ctx f = unsafePerformIO (onBackend ctx f)
 
 -- | Performs some action @f@ on the backend. The action
---   receives a continuation that it must execute to
+--   receives a continuation that it must be executed to
 --   communicate its results back to the caller.
 --   Note: failure to do so will hang the program.
 onBackend :: Ctx s -> ( (a -> IO ()) -> IO () ) -> IO a
 onBackend ctx f = do
-  var <- newEmptyMVar
+  var <- newEmptyMVar  -- future for final result
   let cont a = putMVar var a
   let comm = f cont
   writeChan (ctxChan ctx) (CommDo comm)
@@ -282,6 +287,10 @@ wrapObj ctx snap o = Obj
 -- | Obtains the current context.
 getCtx :: TransactM s (Ctx s)
 getCtx = TransactM ask
+
+-- | Obtains the current snapshot.
+getSnap :: Ctx s -> TransactM s (Snap s)
+getSnap ctx = TransactM $ liftIO $ readIORef (ctxSnap ctx)
 
 -- | Publishes the object, which either destructively updates the
 --   given memory space or creates a new one. It returns the

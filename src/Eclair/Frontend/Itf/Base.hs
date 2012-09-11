@@ -33,12 +33,11 @@ class IsObj o => HasModify o where
   modify :: (IsStore s, ObjStore o ~ s) => (ObjType o -> ObjType o) -> Obj o -> Obj o
 
 -- | Wraps a plain value into an object.
---   Note: it needs a context and snapshot.
+--   Todo: all objects should be associated in a snapshot, so the implementation
+--   of this function should grab the latest snapshot from the Ctx object. Alternatively,
+--   we can parameterize it with an explicit snapshot.
 class IsObj o => HasWrap o where
   wrap :: (IsStore s, ObjStore o ~ s) => Ctx s -> ObjType o -> Obj o
-  wrap = wrap' Nothing
-
-  wrap' :: (IsStore s, ObjStore o ~ s) => Maybe (Snap s) -> Ctx s -> ObjType o -> Obj o
 
 class (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
 instance (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
