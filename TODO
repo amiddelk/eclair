@@ -5,3 +5,5 @@
 * implement the interface for the various data types for various stores
 * make examples
 * make tests
+
+* rename: Backend.### -> Store.###

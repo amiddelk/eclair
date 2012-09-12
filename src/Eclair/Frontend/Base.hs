@@ -5,15 +5,16 @@ module Eclair.Frontend.Base
   , IsStore, Trans, Snap, Ref
   , openTransaction, abortTransaction, commitTransaction
   , createSnapshot, disposeSnapshot
-  , accessSpace, allocSpace, storeSpace
+  , accessSpace, allocSpace, updateSpace
   , onTransactionRestart
   , IsRoot, joinRoots
   , IsObj
   , ObjStore, ObjType, Obj
   , objValue, objCtx, objSnap
   , TransactionRestart(RequireRestart)
-  , transactionally, onBackend, onBackendPure, wrapObj, getCtx
-  , publish, create, store, access
+  , transactionally, onBackend, onBackendPure
+  , wrapObj, getCtx, getSnap
+  , publish, create, update, access
   ) where
 
 import Control.Applicative
@@ -25,7 +26,6 @@ import Control.Monad
 import Control.Monad.Fix
 import Control.Monad.Reader
 import Control.Monad.Trans
-import Data.HashTable
 import Data.IORef
 import Data.Typeable
 import System.IO.Unsafe
@@ -89,8 +89,8 @@ class IsStore s where
   allocSpace        :: IsRoot o => s -> Trans s -> Snap s -> o -> (Ref s o -> IO ()) -> IO ()
 
   -- | Stores the object @o@ (in the given snapshot) as root in the space identified by the reference.
-  storeSpace        :: IsRoot o => s -> Trans s -> Snap s -> Ref s o -> o -> (() -> IO ()) -> IO ()
-
+  updateSpace       :: IsRoot o => s -> Trans s -> Snap s -> Ref s o -> o -> (() -> IO ()) -> IO ()
+ 
   -- | A handler that is called prior to restarting a transaction. Because
   --   transactions are pure, a restart can only have a different
   --   outcome when the store has been modified in the mean time. This handler
@@ -305,15 +305,15 @@ publish mbRef obj =
   in TransactM $ liftIO $ onBackend ctx $ \k ->
        case mbRef of
          Nothing  -> allocSpace store trans snap val k
-         Just ref -> storeSpace store trans snap ref val $ const $ k ref
+         Just ref -> updateSpace store trans snap ref val $ const $ k ref
 
 -- | Creates a new memory space with the given object as root.
 create :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Obj o -> TransactM s (Ref s o)
 create = publish Nothing
 
 -- | Destructively updates a memory space.
-store :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Ref s o -> Obj o -> TransactM s ()
-store ref = void . publish (Just ref)
+update :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Ref s o -> Obj o -> TransactM s ()
+update ref = void . publish (Just ref)
 
 -- | In the current transaction, creates a (local) snapshot and opens the
 --   referenced space in it, giving the object that forms the root of its
