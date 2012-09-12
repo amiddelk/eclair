@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, DeriveDataTypeable #-}
+{-# LANGUAGE TypeFamilies, DeriveDataTypeable, FlexibleInstances #-}
 module Eclair.Frontend.Base 
   ( TransactM
   , Ctx, ctxStore, ctxTrans
@@ -9,8 +9,9 @@ module Eclair.Frontend.Base
   , onTransactionRestart
   , IsRoot, joinRoots
   , IsObj
-  , ObjStore, ObjType, Obj
-  , objValue, objCtx, objSnap
+  , ObjStore, ObjType, Obj, ObjRef
+  , objValue, objCtx, objSnap, wrapRef
+  , TxnResult, NF(NF), exportResult
   , TransactionRestart(RequireRestart)
   , transactionally, onBackend, onBackendPure
   , wrapObj, getCtx, getSnap
@@ -70,7 +71,7 @@ instance Applicative (TransactM s) where
 --   in the store. When a space is accessed to obtain its contents, a snapshot
 --   @Snap@ is created inside the transaction in which the pure objects reside
 --   (accessible only by the transaction).
-class IsStore s where
+class Eq s => IsStore s where
   type Trans s :: *
   type Snap s :: *
   type Ref s :: * -> *
@@ -148,6 +149,56 @@ data Obj o = Obj
   , objSnap  :: !(Snap (ObjStore o))
   }
 
+-- | Wrapper around a reference that can be moved out of the
+--   transaction and keeps track of the store it was created in.
+data ObjRef o = ObjRef
+  { refBackend :: !( Ref (ObjStore o) o )
+  , refStore   :: !( ObjStore o )
+  }
+
+-- | ObjRefs can be exported out of a transaction
+instance TxnResult (ObjRef o) where
+  exportResult ref = do
+    evaluate ref
+    return ref
+
+assertSameStore :: (IsStore s, s ~ ObjStore o) => Ctx s -> ObjRef o -> IO ()
+assertSameStore ctx ref =
+  unless (ctxStore ctx == refStore ref) $
+    error "a reference must be used with the same store instance that created it."
+
+
+-- * Values exportable from a transaction
+
+-- | An interface for preparing values, that are the result of
+--   a transaction, for leaving the scope of a transaction.
+class TxnResult a where
+  exportResult :: a -> IO a
+
+instance TxnResult () where
+  exportResult = evaluate
+
+instance TxnResult Int where
+  exportResult = evaluate
+
+instance TxnResult Bool where
+  exportResult = evaluate
+
+-- | A wrapper around results that can be evaluated to normal form.
+--   These results can be exported from the transaction.
+--
+--   Above are also some direct instances of TxnResult for common cases.
+newtype NF a = NF a
+
+-- | Fully-evaluated data cannot refer to lazy values in the transaction,
+--   thus are safe to be returned by the transaction.
+instance NFData a => TxnResult (NF a) where
+  exportResult r =
+    case r of
+      NF a -> do
+        evaluate $ rnf a
+        return r
+
 
 -- * The toplevel function.
 
@@ -160,11 +211,8 @@ instance Exception TransactionRestart
 
 -- | @transactionally s f@ exposes the operations on @s@ to @f@, which
 -- are run in the @TransactM@ monad. The transaction gives access to lazily created
--- snapshots of the store. To prevent the result value @a@ to refer
--- to an unevaluated part of a snapshot, the result is evaluated to
--- normal form before closing the transaction, hence the requirement on
--- @NFData@.
-transactionally :: (NFData a, IsStore s) => s -> TransactM s a -> IO a
+-- snapshots of the store.
+transactionally :: (TxnResult a, IsStore s) => s -> TransactM s a -> IO a
 transactionally store txn = loop where
   loop = handle (\RequireRestart -> onTransactionRestart store >> loop) step
   step = bracketOnError (openTransaction store) (abortTransaction store) $ \trans ->
@@ -218,13 +266,13 @@ createSnapRef store trans snap chan =
   mkWeakPtr snap $ Just $ writeChan chan $! CommCleanup $ disposeSnapshot store trans snap
 
 -- | Runs the transaction, thereby producing commands (internal function).
-produce :: NFData a => MVar a -> Ctx s -> TransactM s a -> IO ()
+produce :: TxnResult a => MVar a -> Ctx s -> TransactM s a -> IO ()
 produce var ctx m =
   let chan = ctxChan ctx in
   handle (\e -> writeChan chan $! CommFailed e) $ do
     res <- runReaderT (unTransactM m) ctx
-    evaluate $ rnf res
-    putMVar var res
+    exported <- exportResult res
+    putMVar var exported
     writeChan chan CommDone
 
 -- | Consumes backend commands and performs them (internal function).
@@ -274,11 +322,19 @@ onBackend ctx f = do
   writeChan (ctxChan ctx) (CommDo comm)
   takeMVar var
 
+-- | Wraps a backend object @o@ into a frontend object @Obj o@.
 wrapObj :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Snap s -> o -> Obj o
 wrapObj ctx snap o = Obj
   { objValue = o
   , objCtx   = ctx
   , objSnap  = snap
+  }
+
+-- | Wraps a backend reference into a frontend reference.
+wrapRef :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Ref s o -> ObjRef o
+wrapRef ctx ref = ObjRef
+  { refBackend = ref
+  , refStore   = ctxStore ctx
   }
 
 
@@ -295,7 +351,8 @@ getSnap ctx = TransactM $ liftIO $ readIORef (ctxSnap ctx)
 -- | Publishes the object, which either destructively updates the
 --   given memory space or creates a new one. It returns the
 --   reference to the memory space.
-publish :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Maybe (Ref s o) -> Obj o -> TransactM s (Ref s o)
+publish :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) =>
+             Maybe (ObjRef o) -> Obj o -> TransactM s (ObjRef o)
 publish mbRef obj =
   let ctx   = objCtx obj
       snap  = objSnap obj
@@ -304,25 +361,31 @@ publish mbRef obj =
       trans = ctxTrans ctx
   in TransactM $ liftIO $ onBackend ctx $ \k ->
        case mbRef of
-         Nothing  -> allocSpace store trans snap val k
-         Just ref -> updateSpace store trans snap ref val $ const $ k ref
+         Nothing  -> allocSpace store trans snap val (k . wrapRef ctx)
+         Just ref -> do
+           assertSameStore ctx ref
+           let backendRef = refBackend ref
+           updateSpace store trans snap backendRef val $ const $ k $ ref
 
 -- | Creates a new memory space with the given object as root.
-create :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Obj o -> TransactM s (Ref s o)
+create :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Obj o -> TransactM s (ObjRef o)
 create = publish Nothing
 
 -- | Destructively updates a memory space.
-update :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Ref s o -> Obj o -> TransactM s ()
+update :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => ObjRef o -> Obj o -> TransactM s ()
 update ref = void . publish (Just ref)
 
 -- | In the current transaction, creates a (local) snapshot and opens the
 --   referenced space in it, giving the object that forms the root of its
 --   contents.
-access :: (IsStore s, IsObj o, s ~ ObjStore o) => Ref s o -> TransactM s (Obj o)
+access :: (IsStore s, IsObj o, s ~ ObjStore o) => ObjRef o -> TransactM s (Obj o)
 access ref = TransactM $ do
   ctx <- ask
-  liftIO $ onBackend ctx $ \k -> do
-    snap <- pushSnapshot ctx
-    let store = ctxStore ctx
-        trans = ctxTrans ctx
-    accessSpace store trans snap ref (k . wrapObj ctx snap)
+  liftIO $ do
+    assertSameStore ctx ref
+    onBackend ctx $ \k -> do
+      snap <- pushSnapshot ctx
+      let store      = ctxStore ctx
+          trans      = ctxTrans ctx
+          backendRef = refBackend ref
+      accessSpace store trans snap backendRef (k . wrapObj ctx snap)

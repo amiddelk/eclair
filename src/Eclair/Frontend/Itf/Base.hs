@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, FlexibleInstances, UndecidableInstances #-}
+{-# LANGUAGE TypeFamilies, FlexibleInstances, UndecidableInstances, GADTs #-}
 module Eclair.Frontend.Itf.Base where
 
 import Eclair.Frontend.Base
@@ -42,8 +42,6 @@ class IsObj o => HasWrap o where
 class (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
 instance (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
 
-class IsObj o => HasIncr o where
-  incr :: (IsStore s, ObjStore o ~ s) => Obj o -> Obj o
-  
-class (HasIncr o, HasWrap o, HasView o) => IsInt o 
-instance (ObjType o ~ Int, HasIncr o, HasWrap o, HasView o) => IsInt o
+-- | A dictionary that stores the proof that the object type of o is equal to t.
+data ObjTypeDict :: * -> * -> * where
+  ObjTypeDict :: (ObjType o ~ t) => ObjTypeDict o t
