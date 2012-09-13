@@ -101,8 +101,8 @@ data Base o
       -- IORef.
       !( IORef (Hist o) )
   | Committed
-      -- the spaces where the parent belongs to
-      !( Set (RSpace o) )
+      -- the space in which the parent node has been created
+      !( RSpace o )
       -- versions of the children
       !( TVar (Hist o) )
 
@@ -153,7 +153,7 @@ data SpaceShared o
       -- | The aliasses (versioned as well)
       !( TVar (Aliasses o) )
   | SpaceUncommitted
-      !( IORef (VersionedObject o) )
+      !( VersionedObject o ) 
 
 -- | Ordered sequence of aliasses.
 type Aliasses o = IntMap (RSpace o)
@@ -250,20 +250,61 @@ readClock s =
 
 
 instance IsRoot (VersionedObject o) where
-  accessSpace = undefined
+
+  accessSpace s txn snap ref output = do
+    -- find a locally updated version, if any.
+    mbLocal <- lookupLocal txn ref
+    case mbLocal of
+      Just obj -> output obj
+      Nothing  ->
+        -- get the appropriate global version
+        case ref of
+          RRef space -> lookupSpace txn space >>= output
 
   allocSpace s txn _ obj output = do
-    objVar   <- newIORef $! obj
-    spaceVar <- newTVarIO $! SpaceUncommitted objVar
+    spaceVar <- newTVarIO $! SpaceUncommitted obj
     u <- newUnique
     let space = RSpace u spaceVar
         ref   = RRef $! space
     registerPublish txn ref obj 
     output ref
 
-  updateSpace = undefined
+  updateSpace s txn _ ref obj output = do
+    registerPublish txn ref obj
+    output ()
 
+-- | The history must contain a mapping with
+--   a key smaller or equal to the @ts@.
+histLookup :: TS -> Hist o -> VersionedObject o
+histLookup ts hist = 
+  case IntMap.splitLookup ts hist of
+    (smaller, mbObj, _) ->
+      case mbObj of
+        Nothing  -> snd $ IntMap.findMax smaller
+        Just obj -> obj
 
+-- | Finds the locally published contents of a space, if any.
+lookupLocal :: RTrans -> RRef (VersionedObject o) -> IO (Maybe (VersionedObject o))
+lookupLocal txn ref = do
+  let published = txnPublish txn
+      key       = unsafeCoerce ref
+  mbRoot <- HashTable.lookup key published
+  case mbRoot of
+    Nothing             -> return Nothing
+    Just (SomeRoot obj) -> return $! unsafeCoerce obj
+
+-- | Finds the object in the space as observed by the given transaction.
+lookupSpace :: RTrans -> RSpace o -> IO (VersionedObject o)
+lookupSpace txn (RSpace _ sharedVar) = do
+  content <- atomically $ readTVar sharedVar
+  case content of
+    SpaceCommitted histVar _ -> do
+      hist <- atomically $ readTMVar histVar
+      let ts = txnStart txn
+      return $! histLookup ts hist 
+    SpaceUncommitted obj -> return obj
+
+-- | Registers the mapping from reference to object with the transaction.
 registerPublish :: RTrans -> RRef (VersionedObject o) -> VersionedObject o -> IO ()
 registerPublish txn ref obj = do
   let tbl = txnPublish txn
@@ -280,3 +321,15 @@ type AnyObject = VersionedObject Whatever
 -- type SomeSpace  = InMemorySpace WhateverValue
 -- type SomeRef    = InMemoryRef WhateverValue
 -- type SomeObject = InMemoryObject WhateverValue
+
+
+-- * Traversal of updates
+
+{-
+foldUpdates :: a -> (a -> Either (Payload o) (Update o) -> IO a) -> VersionedObject o -> IO a
+foldUpdates a f obj =
+  case obj of
+     -> do a' <- f payload a
+           obj' = next obj
+           foldUpdates a f obj'
+-}

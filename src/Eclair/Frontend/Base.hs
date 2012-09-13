@@ -147,6 +147,7 @@ data Obj o = Obj
   { objValue :: !o
   , objCtx   :: !(Ctx (ObjStore o))
   , objSnap  :: !(Snap (ObjStore o))
+  , objRef   :: !(Maybe (Ref (ObjStore o) o))
   }
 
 -- | Wrapper around a reference that can be moved out of the
@@ -324,11 +325,12 @@ onBackend ctx f = do
   takeMVar var
 
 -- | Wraps a backend object @o@ into a frontend object @Obj o@.
-wrapObj :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Snap s -> o -> Obj o
-wrapObj ctx snap o = Obj
+wrapObj :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Snap s -> Maybe (Ref s o) -> o -> Obj o
+wrapObj ctx snap ref o = Obj
   { objValue = o
   , objCtx   = ctx
   , objSnap  = snap
+  , objRef   = ref
   }
 
 -- | Wraps a backend reference into a frontend reference.
@@ -389,4 +391,4 @@ access ref = TransactM $ do
       let store      = ctxStore ctx
           trans      = ctxTrans ctx
           backendRef = refBackend ref
-      accessSpace store trans snap backendRef (k . wrapObj ctx snap)
+      accessSpace store trans snap backendRef (k . wrapObj ctx snap (Just backendRef))
