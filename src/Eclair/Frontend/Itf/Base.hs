@@ -4,6 +4,7 @@ module Eclair.Frontend.Itf.Base where
 import Eclair.Frontend.Base
 
 
+{-
 -- | Variant of @IsRoot@ that has a purely functional merging
 --   function.
 class IsRootPure o where
@@ -12,6 +13,7 @@ class IsRootPure o where
 -- | Automatic conversion of a pure root into a conventional root.
 instance IsRootPure o => IsRoot o where
   joinRoots p q = return $ joinRootsPure p q
+-}
 
 
 -- * Common interfaces to objects

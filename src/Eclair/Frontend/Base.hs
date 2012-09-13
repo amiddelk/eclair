@@ -7,7 +7,7 @@ module Eclair.Frontend.Base
   , createSnapshot, disposeSnapshot
   , accessSpace, allocSpace, updateSpace
   , onTransactionRestart
-  , IsRoot, joinRoots
+  , IsRoot
   , IsObj
   , ObjStore, ObjType, Obj, ObjRef
   , objValue, objCtx, objSnap, wrapRef
@@ -83,15 +83,6 @@ class Eq s => IsStore s where
   createSnapshot    :: s -> Trans s -> Maybe (Snap s) -> IO (Snap s)
   disposeSnapshot   :: s -> Trans s -> Snap s -> IO ()
 
-  -- | Obtains the root object from the space identified by the reference in the given snapshot.
-  accessSpace       :: s -> Trans s -> Snap s -> Ref s o -> (o -> IO ()) -> IO ()
-
-  -- | Allocates a new space with the given root object as it contents and returns a reference to it.
-  allocSpace        :: IsRoot o => s -> Trans s -> Snap s -> o -> (Ref s o -> IO ()) -> IO ()
-
-  -- | Stores the object @o@ (in the given snapshot) as root in the space identified by the reference.
-  updateSpace       :: IsRoot o => s -> Trans s -> Snap s -> Ref s o -> o -> (() -> IO ()) -> IO ()
- 
   -- | A handler that is called prior to restarting a transaction. Because
   --   transactions are pure, a restart can only have a different
   --   outcome when the store has been modified in the mean time. This handler
@@ -129,9 +120,18 @@ data Ctx s = Ctx
 --   These roots must be a commutative semi-monoid (or a
 --   commutative semi-group). The joining operation may use
 --   side effects (it's in the IO monad).
-class IsRoot o where
+class IsObj o => IsRoot o where
+  -- | Obtains the root object from the space identified by the reference in the given snapshot.
+  accessSpace :: (IsStore s, s ~ ObjStore o) => s -> Trans s -> Snap s -> Ref s o -> (o -> IO ()) -> IO ()
+
+  -- | Allocates a new space with the given root object as it contents and returns a reference to it.
+  allocSpace :: (IsStore s, s ~ ObjStore o) => IsRoot o => s -> Trans s -> Snap s -> o -> (Ref s o -> IO ()) -> IO ()
+
+  -- | Stores the object @o@ (in the given snapshot) as root in the space identified by the reference.
+  updateSpace :: (IsStore s, s ~ ObjStore o) => s -> Trans s -> Snap s -> Ref s o -> o -> (() -> IO ()) -> IO ()
+
   -- | Merges the contents of two spaces.
-  joinRoots :: o -> o -> IO o
+  -- joinRoots :: o -> o -> IO o
 
 
 -- | An object is a sharable node in the data-graph of a memory
@@ -352,7 +352,7 @@ getSnap ctx = TransactM $ liftIO $ readIORef (ctxSnap ctx)
 -- | Publishes the object, which either destructively updates the
 --   given memory space or creates a new one. It returns the
 --   reference to the memory space.
-publish :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) =>
+publish :: (IsStore s, IsRoot o, s ~ ObjStore o) =>
              Maybe (ObjRef o) -> Obj o -> TransactM s (ObjRef o)
 publish mbRef obj =
   let ctx   = objCtx obj
@@ -369,17 +369,17 @@ publish mbRef obj =
            updateSpace store trans snap backendRef val $ const $ k $ ref
 
 -- | Creates a new memory space with the given object as root.
-create :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => Obj o -> TransactM s (ObjRef o)
+create :: (IsStore s, IsRoot o, s ~ ObjStore o) => Obj o -> TransactM s (ObjRef o)
 create = publish Nothing
 
 -- | Destructively updates a memory space.
-update :: (IsStore s, IsRoot o, IsObj o, s ~ ObjStore o) => ObjRef o -> Obj o -> TransactM s ()
+update :: (IsStore s, IsRoot o, s ~ ObjStore o) => ObjRef o -> Obj o -> TransactM s ()
 update ref = void . publish (Just ref)
 
 -- | In the current transaction, creates a (local) snapshot and opens the
 --   referenced space in it, giving the object that forms the root of its
 --   contents.
-access :: (IsStore s, IsObj o, s ~ ObjStore o) => ObjRef o -> TransactM s (Obj o)
+access :: (IsStore s, IsRoot o, s ~ ObjStore o) => ObjRef o -> TransactM s (Obj o)
 access ref = TransactM $ do
   ctx <- ask
   liftIO $ do

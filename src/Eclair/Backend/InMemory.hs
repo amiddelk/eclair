@@ -20,12 +20,12 @@ data InMemoryStore = InMemoryStore
     storeLog   :: !( TVar (IntMap (WeakRef TransHist)) )
   , -- global clock
     storeClock :: !( TVar Int )
-  , -- the starting stamp of the oldest running transaction
+  , -- the starting time stamp of the oldest running transaction
     storeOldestRunning :: !(TVar Int)
   }
 
 -- | An item in the transaction log, keeping track of the spaces that
---   were modified by a transaction, as well as the number of spaces
+--   were modified by a transaction and the number of spaces
 --   of which the version of the transaction is still current.
 --
 --   The count should be decremented when the transaction is no longer
@@ -61,7 +61,7 @@ data InMemorySpace o
   = Space
       { spaceCurrent :: !( TVar (InMemoryObject o) )
       , spaceStamp   :: !( TVar Unique )
-      , -- implementation will assume a collision-less mapping from unique to int
+      , -- implementation will assume a collision-free mapping 
         spaceSnaps   :: !( TVar (IntMap (InMemoryObject o)) )
       }
 
@@ -77,8 +77,8 @@ data InMemoryObject o
 -- * References to values of whatever type
 
 type WhateverValue = () -- use Any data type
-type SomeInMemorySpace  = InMemorySpace WhateverValue
-type SomeInMemoryRef    = InMemoryRef WhateverValue
+type SomeInMemorySpace  = InMemorySpace  WhateverValue
+type SomeInMemoryRef    = InMemoryRef    WhateverValue
 type SomeInMemoryObject = InMemoryObject WhateverValue
 
 
