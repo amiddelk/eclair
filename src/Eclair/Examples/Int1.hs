@@ -31,7 +31,15 @@ runGeneric s = do
   v <- inspect s r
   putStrLn ("v: " ++ show v)
 
+
 {-
+newtype RSharedInt = RSharedInt ()
+instance IsObj RSharedInt where
+  type ObjStore RSharedInt = RStore
+  type ObjType RSharedInt = Int
+
+type instance ObjFam (TSharedInt t) RStore = RSharedInt
+
 run :: IO ()
 run = do
   s <- initStore
