@@ -1,24 +1,39 @@
+{-# LANGUAGE TypeFamilies #-}
 module Eclair.Examples.Int1 where
 
+import Control.Monad
 import Eclair.Frontend
 import Eclair.Backend.Reference
 
 
-
-genericRun s = do
-  {-
-  -- create some integer
-  r <- transactionally s $ do
+createRef s v =
+  transactionally s $ do
     ctx <- getCtx
-    let obj = wrap ctx (0 :: Int)
-    return ()
-    -- create obj
-  -}
+    let obj = wrap ctx TSharedInt v
+    create obj
 
-  return ()
+increment s r =
+  transactionally s $ do
+    i <- access r
+    let i' = incr i
+    update r i
 
+inspect s r =
+  transactionally s $ do
+  i <- access r
+  let v = view i
+  return (NF v)
 
-main :: IO ()
-main = do
+runGeneric s = do
+  r <- createRef s 0
+  increment s r
+  increment s r
+  v <- inspect s r
+  putStrLn ("v: " ++ show v)
+
+{-
+run :: IO ()
+run = do
   s <- initStore
-  genericRun s
+  runGeneric s
+-}

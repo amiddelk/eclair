@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, FlexibleInstances, UndecidableInstances #-}
+{-# LANGUAGE TypeFamilies, FlexibleInstances, UndecidableInstances, GADTs #-}
 module Eclair.Frontend.Itf.Integer where
 
 import Eclair.Frontend.Base
@@ -15,3 +15,8 @@ class (HasIncr o, HasWrap o, HasView o) => IsInt o where
 
 instance (ObjType o ~ Int, HasIncr o, HasWrap o, HasView o) => IsInt o where
   intTypeDict = ObjTypeDict
+
+-- type index for shared integers
+data TSharedInt t where
+  TSharedInt :: TSharedInt Int
+

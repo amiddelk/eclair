@@ -189,6 +189,7 @@ instance TxnResult Bool where
 --
 --   Above are also some direct instances of TxnResult for common cases.
 newtype NF a = NF a
+  deriving (Eq, Ord, Show, Typeable)
 
 -- | Fully-evaluated data cannot refer to lazy values in the transaction,
 --   thus are safe to be returned by the transaction.

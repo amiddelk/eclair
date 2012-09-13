@@ -37,7 +37,7 @@ class IsObj o => HasModify o where
 --   of this function should grab the latest snapshot from the Ctx object. Alternatively,
 --   we can parameterize it with an explicit snapshot.
 class IsObj o => HasWrap o where
-  wrap :: (IsStore s, ObjStore o ~ s) => Ctx s -> ObjType o -> Obj o
+  wrap :: (IsStore s, ObjStore o ~ s, ObjFam ix s ~ o) => Ctx s -> ix -> ObjType o -> Obj o
 
 class (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
 instance (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
@@ -45,3 +45,11 @@ instance (IsObj o, HasView o, HasModify o, HasWrap o) => IsPlain o
 -- | A dictionary that stores the proof that the object type of o is equal to t.
 data ObjTypeDict :: * -> * -> * where
   ObjTypeDict :: (ObjType o ~ t) => ObjTypeDict o t
+
+
+-- * A type for specifying object types generic in the type of store.
+
+-- | An object family is a collection of object types of the same kind of
+--   object (determined by index @ix@) but with different implementations
+--   based on the store @s@.
+type family ObjFam ix s :: *
