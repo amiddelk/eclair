@@ -95,10 +95,10 @@ data Base o
       -- the space in which the parent node has been created
       !( RSpace o )
       -- versions of the children
-      !( TVar (Hist o) )
+      !( TVar (ObjHist o) )
 
 -- | Ordered sequence of links to a base object.
-type Hist o = IntMap (VersionedObject o)
+type ObjHist o = IntMap (VersionedObject o)
 
 -- | A space is gives a reference into the versioned
 --   data graph, and allows versioned updates to be
@@ -139,15 +139,15 @@ instance Show (RSpace o) where
 data SpaceShared o
   = SpaceCommitted
       -- | The objects assigned to the space
-      !( TMVar (Hist o) )
+      !( TMVar (ObjHist o) )
 
       -- | The aliasses (versioned as well)
-      !( TVar (Aliasses o) )
+      !( TVar (AliassesHist o) )
   | SpaceUncommitted
       !( VersionedObject o ) 
 
 -- | Ordered sequence of aliasses.
-type Aliasses o = IntMap (Set (RSpace o))
+type AliassesHist o = IntMap (Set (RSpace o))
 
 
 -- | The store.
@@ -190,14 +190,9 @@ data RTrans = RTrans
 data RootObject :: * where
   SomeRoot :: (vo ~ VersionedObject o, IsRoot vo) => !vo -> RootObject
 
--- | This reference implementation probably does not need
---   to have a notion of a snapshot.
-data RSnap = RSnap
-
 instance IsStore RStore where
   type Ref RStore   = RRef
   type Trans RStore = RTrans
-  type Snap RStore  = RSnap
 
   openTransaction  s = do 
     ts <- readClock s
@@ -206,9 +201,6 @@ instance IsStore RStore where
 
   abortTransaction _ _ = return ()
   commitTransaction = undefined
-
-  createSnapshot  _ _ _ = return RSnap
-  disposeSnapshot _ _ _ = return ()
 
  
 -- | Initializes the store.
@@ -242,27 +234,26 @@ readClock s =
 
 instance IsRoot (VersionedObject o) where
 
-  accessSpace s txn snap ref output = do
+  accessSpace s txn ref = do
     -- find a locally updated version, if any.
     mbLocal <- lookupLocal txn ref
     case mbLocal of
-      Just obj -> output obj
+      Just obj -> return obj
       Nothing  ->
         -- get the appropriate global version
         case ref of
-          RRef space -> lookupSpace txn space >>= output
+          RRef space -> lookupSpace txn space
 
-  allocSpace s txn _ obj output = do
+  allocSpace s txn obj = do
     spaceVar <- newTVarIO $! SpaceUncommitted obj
     u <- newUnique
     let space = RSpace u spaceVar
         ref   = RRef $! space
     registerPublish txn ref obj 
-    output ref
+    return ref
 
-  updateSpace s txn _ ref obj output = do
+  updateSpace s txn ref obj =
     registerPublish txn ref obj
-    output ()
 
 -- | The history must contain a mapping with
 --   a key smaller or equal to the @ts@.
@@ -334,7 +325,7 @@ buildUpdates ts accessSpace f obj = foldObject obj where
       Unlinked obj -> foldObject obj >>= g
       Committed creationSpace histVar -> do
         visible <- isVisible ts creationSpace accessSpace
-        hist <- atomically $ readTVar histVar
+        hist    <- atomically $ readTVar histVar
         let obj = histLookup ts hist
         payload <- foldObject obj
         if visible
@@ -357,7 +348,7 @@ foldUpdates ts accessSpace f initv obj = foldObject obj initv where
 
   foldBase g base a = do
     case base of
-      None -> either id id `fmap` g a
+      None         -> either id id `fmap` g a
       Unlinked obj -> step (g a) (foldObject obj)
       Committed creationSpace histVar -> do
         visible <- isVisible ts creationSpace accessSpace
