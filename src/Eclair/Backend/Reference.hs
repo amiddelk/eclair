@@ -91,15 +91,6 @@ data Base o
   = None
   | Unlinked
       !( VersionedObject o )
-  | Uncommitted
-      -- the space where the parent belongs to
-      -- !( RSpace o )
-
-      -- versions of the children:
-      -- these links exist in the same transaction, and are
-      -- thus accessed from the same thread: we can use an
-      -- IORef.
-      !( IORef (Hist o) )
   | Committed
       -- the space in which the parent node has been created
       !( RSpace o )
@@ -156,7 +147,7 @@ data SpaceShared o
       !( VersionedObject o ) 
 
 -- | Ordered sequence of aliasses.
-type Aliasses o = IntMap (RSpace o)
+type Aliasses o = IntMap (Set (RSpace o))
 
 
 -- | The store.
@@ -275,7 +266,7 @@ instance IsRoot (VersionedObject o) where
 
 -- | The history must contain a mapping with
 --   a key smaller or equal to the @ts@.
-histLookup :: TS -> Hist o -> VersionedObject o
+histLookup :: TS -> IntMap t -> t
 histLookup ts hist = 
   case IntMap.splitLookup ts hist of
     (smaller, mbObj, _) ->
@@ -325,11 +316,74 @@ type AnyObject = VersionedObject Whatever
 
 -- * Traversal of updates
 
-{-
-foldUpdates :: a -> (a -> Either (Payload o) (Update o) -> IO a) -> VersionedObject o -> IO a
-foldUpdates a f obj =
-  case obj of
-     -> do a' <- f payload a
-           obj' = next obj
-           foldUpdates a f obj'
--}
+buildUpdates ::
+  TS -> RSpace o ->
+  (Either (Payload o) (Update o) -> Payload o -> IO (Payload o)) ->
+  VersionedObject o -> IO (Payload o)
+buildUpdates ts accessSpace f obj = foldObject obj where
+  foldObject (VersionedObject _ nodeVar) = do
+    node <- atomically $ readTVar nodeVar
+    case node of
+      Join payload None  -> return payload
+      Join payload base  -> foldBase (f $ Left payload) base
+      Update update base -> foldBase (f $ Right update) base
+
+  foldBase g base = do
+    case base of
+      None         -> error "foldBase: encountered a NONE value"
+      Unlinked obj -> foldObject obj >>= g
+      Committed creationSpace histVar -> do
+        visible <- isVisible ts creationSpace accessSpace
+        hist <- atomically $ readTVar histVar
+        let obj = histLookup ts hist
+        payload <- foldObject obj
+        if visible
+         then g payload
+         else return payload
+
+-- | folds over the updates from most-recent to older,
+--   where returning @Right b@ causes the scan to stop
+--   with the result @b@.
+foldUpdates ::
+  TS -> RSpace o ->
+  (Either (Payload o) (Update o) -> a -> IO (Either a a)) -> a ->
+  VersionedObject o -> IO a
+foldUpdates ts accessSpace f initv obj = foldObject obj initv where
+  foldObject (VersionedObject _ nodeVar) a = do
+    node <- atomically $ readTVar nodeVar
+    case node of
+      Join payload base  -> foldBase (f $ Left payload) base a
+      Update update base -> foldBase (f $ Right update) base a
+
+  foldBase g base a = do
+    case base of
+      None -> either id id `fmap` g a
+      Unlinked obj -> step (g a) (foldObject obj)
+      Committed creationSpace histVar -> do
+        visible <- isVisible ts creationSpace accessSpace
+        let m = if visible then g a else return (Left a)
+        step m $ \a' -> do
+          hist <- atomically $ readTVar histVar
+          let obj = histLookup ts hist
+          foldObject obj a'
+
+  step m k = do
+    res <- m
+    case res of
+      Left a'  -> k a'
+      Right a' -> return a'
+
+-- | Checks if the creator-space is a visible alias of the
+--   accessor-space.
+isVisible :: TS -> RSpace o -> RSpace o -> IO Bool
+isVisible ts creator@(RSpace crUnq _) (RSpace acUnq accessorVar)
+  | crUnq == acUnq = return True
+  | otherwise      = do
+      acShared <- atomically $ readTVar accessorVar
+      case acShared of
+        SpaceUncommitted _ -> error "isVisible: an object may not be shared with a different space"
+        SpaceCommitted _ aliassesVar -> do
+          aliassesHist <- atomically $ readTVar aliassesVar
+          let aliasses = histLookup ts aliassesHist
+              visible  = creator `Set.member` aliasses
+          return visible
