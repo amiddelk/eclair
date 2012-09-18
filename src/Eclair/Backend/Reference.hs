@@ -1,7 +1,7 @@
 -- | A reference/proof-of-concept implementation of @Eclair.Frontend@
 --   in a simplified setting, using in-memory concurrent transactions.
 
-{-# LANGUAGE TypeFamilies, GADTs, EmptyDataDecls #-}
+{-# LANGUAGE TypeFamilies, GADTs, EmptyDataDecls, Rank2Types #-}
 module Eclair.Backend.Reference where
 
 import Control.Applicative
@@ -55,6 +55,9 @@ instance IsObj (VersionedObject o) where
   type ObjStore (VersionedObject o) = RStore
   type ObjType (VersionedObject o)  = Payload o
 
+hashVersionedObject :: VersionedObject o -> Int32
+hashVersionedObject (VersionedObject u _) = fromIntegral $ hashUnique u
+
 -- | A single version of a versioned object is a linear chain
 --   of update-nodes, and all versions of a versioned object
 --   are represented as an acyclic graph of update-nodes, where
@@ -98,7 +101,7 @@ data Base o
       !( VersionedObject o )
   | Committed
       -- the space in which the parent node has been created
-      !( RSpace o )
+      !AnySpace
       -- versions of the children
       !( TVar (ObjHist o) )
 
@@ -186,9 +189,10 @@ hashRRef :: RRef o -> Int32
 hashRRef (RRef (RSpace u _)) = fromIntegral $ hashUnique u 
 
 data RTrans = RTrans
-  { txnStartTime   :: !TS
-  , txnCommitTime  :: !( TVar (Maybe TS) )
-  , txnPublish     :: !( HashTable AnyRef RootObject )
+  { txnStartTime    :: !TS
+  , txnCommitTime   :: !( TVar (Maybe TS) )
+  , txnPublish      :: !( HashTable AnyRef RootObject )
+  , txnPayloadCache :: !( HashTable AnyObject AnyPayload )
   }
 
 -- | A root object of a space, of which the actual type is hidden (existential).
@@ -200,13 +204,15 @@ instance IsStore RStore where
   type Trans RStore = RTrans
 
   openTransaction  s = do 
-    ts  <- readClock s
-    var <- newTVarIO Nothing
-    updates <- HashTable.new (==) hashRRef
+    ts       <- readClock s
+    var      <- newTVarIO Nothing
+    updates  <- HashTable.new (==) hashRRef
+    payloads <- HashTable.new (==) hashVersionedObject
     return $ RTrans
-      { txnStartTime  = ts
-      , txnCommitTime = var
-      , txnPublish    = updates
+      { txnStartTime    = ts
+      , txnCommitTime   = var
+      , txnPublish      = updates
+      , txnPayloadCache = payloads
       }
 
   abortTransaction _ _ = return ()
@@ -247,11 +253,12 @@ instance IsStore RStore where
       let -- if committed: update the root to the current state of the space
           -- if uncommitted: register the update nodes with the space
           processSpace :: PublishInfo -> IO ()
-          processSpace (PubUncommitted (RRef spUntyped) spaceVarUntyped (SomeRoot patch)) = do
+          processSpace (PubUncommitted refUntyped@(RRef spUntyped) spaceVarUntyped (SomeRoot patch)) = do
             let sp       = unsafeCoerce spUntyped
                 spaceVar = unsafeCoerce spaceVarUntyped
-            registerSpace sp ts patch
-            shared <- initializeSpace ts sp patch
+                ref      = unsafeCoerce refUntyped
+            patch' <- joinRoots s txn ref patch Nothing
+            shared <- initializeSpace ts sp patch'
             atomically $ writeTVar spaceVar $! shared
           processSpace (PubCommitted refUntyped@(RRef spUntyped) histUntyped histVarUntyped (SomeRoot patch)) = do
             -- coerce from the "whatever" type to the type of patch
@@ -260,7 +267,7 @@ instance IsStore RStore where
                 ref     = unsafeCoerce refUntyped
                 sp      = unsafeCoerce spUntyped
                 current = histLookup ts hist
-            patch' <- joinRoots s txn ref patch current
+            patch' <- joinRoots s txn ref patch $ Just current
             let hist' = histInsert ts patch' hist
             atomically $ putTMVar histVar $! hist'
 
@@ -300,11 +307,30 @@ readClock s =
     t <- readTVar clock
     return t
 
+-- | Context information for type-specific join functions.
+--   To recurse on their subcomponents, the functions
+--   @jiRegister@ and @jiJoin@ should be used.
+data JoinInfo = JoinInfo
+  { jiTxn      :: !RTrans
+  , jiStore    :: !RStore
+  , jiSpace    :: !AnySpace    -- the space (untyped)
+  , jiTS       :: !TS          -- timestamp of the commit
+  , jiRegister :: !( forall o . IsPatch o => VersionedObject o -> IO () )
+  , jiJoin     :: !( forall o . IsPatch o => VersionedObject o -> VersionedObject o -> IO (VersionedObject o) )
+  }
 
-class VersionedJoin o where
-  joinObjects :: TS -> RSpace o -> VersionedObject o -> VersionedObject o -> IO (VersionedObject o)
+-- | Defines type-specific join functions.
+class IsPatch o where
+  -- | Updates the left hand side with patches of the right hand side.
+  joinPatches :: JoinInfo -> VersionedObject o -> VersionedObject o -> IO (VersionedObject o)
 
-instance VersionedJoin o => IsRoot (VersionedObject o) where
+  -- | Registers the substructure of the object. The contents of the object is provided
+  --   as either the payload or an update.
+  registerSubstructure :: JoinInfo -> VersionedObject o -> Either (Payload o) (Update o) -> IO ()
+
+-- | Generic implementation for the vesioned object space given type-specific
+--   join functions.
+instance IsPatch o => IsRoot (VersionedObject o) where
   accessSpace s txn ref = do
     -- find a locally updated version, if any.
     mbLocal <- lookupLocal txn ref
@@ -326,9 +352,20 @@ instance VersionedJoin o => IsRoot (VersionedObject o) where
   updateSpace s txn ref obj =
     registerPublish txn ref obj
 
-  joinRoots _ txn (RRef space) new current = do
+  joinRoots s txn (RRef space) new mbCurrent = do
     Just ts <- atomically $ readTVar $ txnCommitTime txn
-    joinObjects ts space new current
+    let info = JoinInfo
+          { jiTxn      = txn, jiStore = s
+          , jiSpace    = unsafeCoerce space
+          , jiTS       = ts
+          , jiRegister = registerSpace info
+          , jiJoin     = mergeSpace info
+          }
+
+    jiRegister info new
+    case mbCurrent of
+      Nothing      -> return new
+      Just current -> jiJoin info new current
 
 -- | The history must contain a mapping with
 --   a key smaller or equal to the @ts@.
@@ -378,8 +415,10 @@ registerPublish txn ref obj = do
 data Whatever :: *
 type AnyRef         = RRef AnyObject
 type AnyObject      = VersionedObject Whatever
+type AnySpace       = RSpace Whatever
 type AnySpaceShared = SpaceShared Whatever
 type AnyObjHist     = ObjHist Whatever
+type AnyPayload     = Payload Whatever
 
 
 -- * Space functionality
@@ -394,27 +433,33 @@ initializeSpace ts sp obj = do
 
 -- | Transforms the states of the versioned objects so
 --   that these go from unlinked to committed.
---   Precondition: unique ownershop of the versioned
+--   Precondition: unique ownershop of the unlinked versioned
 --   object chain.
-registerSpace :: RSpace o -> TS -> VersionedObject o -> IO ()
-registerSpace sp ts (VersionedObject _ var) = do
+registerSpace :: IsPatch o => JoinInfo -> VersionedObject o -> IO ()
+registerSpace info obj@(VersionedObject _ var) = do
   node <- atomically $ readTVar var
-
-  let register base f =
+  let sp = jiSpace info
+      ts = jiTS info
+      registerTail base f =
         case base of
           Unlinked prev -> do
             histVar <- newTVarIO $! IntMap.singleton ts prev
             let base' = Committed sp histVar
                 node' = f base'
             atomically $ writeTVar var $! node'
-            registerSpace sp ts prev            
+            registerSpace info prev            
           _             -> return ()
-          
-
   case node of
-    Join p b   -> register b (Join p)
-    Update u b -> register b (Update u)
+    Join p b   -> do
+      registerSubstructure info obj (Left p)
+      registerTail b (Join p)
+    Update u b -> do
+      registerSubstructure info obj (Right u)
+      registerTail b (Update u)
 
+mergeSpace :: IsPatch o => JoinInfo -> VersionedObject o -> VersionedObject o -> IO (VersionedObject o)
+mergeSpace info new current = do
+  error "todo: implement mergeSpace"
 
 -- * Traversal of updates
 
@@ -477,8 +522,8 @@ foldUpdates ts accessSpace f initv obj = foldObject obj initv where
 
 -- | Checks if the creator-space is a visible alias of the
 --   accessor-space.
-isVisible :: TS -> RSpace o -> RSpace o -> IO Bool
-isVisible ts creator@(RSpace crUnq _) (RSpace acUnq accessorVar)
+isVisible :: TS -> AnySpace -> RSpace o -> IO Bool
+isVisible ts creatorUntyped@(RSpace crUnq _) (RSpace acUnq accessorVar)
   | crUnq == acUnq = return True
   | otherwise      = do
       acShared <- atomically $ readTVar accessorVar
@@ -487,5 +532,6 @@ isVisible ts creator@(RSpace crUnq _) (RSpace acUnq accessorVar)
         SpaceCommitted _ aliassesVar -> do
           aliassesHist <- atomically $ readTVar aliassesVar
           let aliasses = histLookup ts aliassesHist
+              creator  = unsafeCoerce creatorUntyped
               visible  = creator `Set.member` aliasses
           return visible
