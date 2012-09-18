@@ -143,11 +143,8 @@ instance Show (RSpace o) where
 --   a reference from a single transaction.
 data SpaceShared o
   = SpaceCommitted
-      -- | A write-lock on the space
-      !( TMVar () )
-
       -- | The objects assigned to the space
-      !( TVar (ObjHist o) )
+      !( TMVar (ObjHist o) )
 
       -- | The aliasses (versioned as well)
       !( TVar (AliassesHist o) )
@@ -222,9 +219,9 @@ instance IsStore RStore where
 
     -- get exclusive access to spaces
     let recoverSpaces = atomically . mapM_ recoverSpace
-        recoverSpace (PubCommitted _ lockVar _ _) = do
-          restoreNeeded <- isEmptyTMVar lockVar
-          when restoreNeeded $ putTMVar lockVar ()
+        recoverSpace (PubCommitted _ hist histVar _) = do
+          restoreNeeded <- isEmptyTMVar histVar
+          when restoreNeeded $ putTMVar histVar hist
         recoverSpace _ = return ()
         grabSpaces = atomically $ forM published $ grabSpace
 
@@ -238,9 +235,9 @@ instance IsStore RStore where
                 SpaceUncommitted -> do
                   -- uncommitted, thus already exclusive to txn
                   return $ PubUncommitted ref stateVar root
-                SpaceCommitted lockVar histVar _ -> do
-                  ()   <- takeTMVar lockVar
-                  return $ PubCommitted ref lockVar histVar root
+                SpaceCommitted histVar _ -> do
+                  hist <- takeTMVar histVar
+                  return $ PubCommitted ref hist histVar root
 
     bracketOnError grabSpaces recoverSpaces $ \pubs -> do
       -- incr+get commit time
@@ -256,24 +253,23 @@ instance IsStore RStore where
             registerSpace sp ts patch
             shared <- initializeSpace ts sp patch
             atomically $ writeTVar spaceVar $! shared
-          processSpace (PubCommitted refUntyped@(RRef spUntyped) lockVar histVarUntyped (SomeRoot patch)) = do
+          processSpace (PubCommitted refUntyped@(RRef spUntyped) histUntyped histVarUntyped (SomeRoot patch)) = do
             -- coerce from the "whatever" type to the type of patch
             let histVar = unsafeCoerce histVarUntyped
+                hist    = unsafeCoerce histUntyped
                 ref     = unsafeCoerce refUntyped
                 sp      = unsafeCoerce spUntyped
-            hist <- atomically $ readTVar histVar
-            let current = histLookup ts hist
+                current = histLookup ts hist
             patch' <- joinRoots s txn ref patch current
             let hist' = histInsert ts patch' hist
-            atomically $ writeTVar histVar $! hist'
-            atomically $ putTMVar lockVar ()
+            atomically $ putTMVar histVar $! hist'
 
       -- process and release the spaces one by one
       forM_ pubs processSpace
 
 data PublishInfo
-  = PubUncommitted  !AnyRef !(TVar (SpaceShared Whatever))  !RootObject
-  | PubCommitted    !AnyRef !(TMVar ())  !(TVar (ObjHist Whatever))  !RootObject
+  = PubUncommitted !AnyRef !(TVar AnySpaceShared) !RootObject
+  | PubCommitted   !AnyRef !AnyObjHist !(TMVar AnyObjHist) !RootObject
 
  
 -- | Initializes the store.
@@ -298,7 +294,7 @@ incrementClock s =
 
 -- | Increments the clock and returns the old value.
 readClock :: RStore -> IO TS
-readClock s = 
+readClock s =
   let clock = storeClock s
   in atomically $ do
     t <- readTVar clock
@@ -363,8 +359,8 @@ lookupSpace :: RTrans -> RSpace o -> IO (VersionedObject o)
 lookupSpace txn (RSpace _ sharedVar) = do
   content <- atomically $ readTVar sharedVar
   case content of
-    SpaceCommitted _ histVar _ -> do
-      hist <- atomically $ readTVar histVar
+    SpaceCommitted histVar _ -> do
+      hist <- atomically $ readTMVar histVar
       let ts = txnStartTime txn
       return $! histLookup ts hist 
     SpaceUncommitted -> error "lookupSpace: cannot be called on an uncommitted space"
@@ -380,8 +376,10 @@ registerPublish txn ref obj = do
 -- * Those pesky type parameters
 
 data Whatever :: *
-type AnyRef    = RRef AnyObject
-type AnyObject = VersionedObject Whatever
+type AnyRef         = RRef AnyObject
+type AnyObject      = VersionedObject Whatever
+type AnySpaceShared = SpaceShared Whatever
+type AnyObjHist     = ObjHist Whatever
 
 
 -- * Space functionality
@@ -390,10 +388,9 @@ initializeSpace :: TS -> RSpace o -> VersionedObject o -> IO (SpaceShared o)
 initializeSpace ts sp obj = do
   let objHist   = IntMap.singleton ts obj
   let aliasHist = IntMap.singleton ts $! Set.singleton sp
-  objVar   <- newTVarIO $! objHist
+  objVar   <- newTMVarIO $! objHist
   aliasVar <- newTVarIO $! aliasHist
-  lockVar  <- newTMVarIO ()
-  return $ SpaceCommitted lockVar objVar aliasVar
+  return $ SpaceCommitted objVar aliasVar
 
 -- | Transforms the states of the versioned objects so
 --   that these go from unlinked to committed.
@@ -487,7 +484,7 @@ isVisible ts creator@(RSpace crUnq _) (RSpace acUnq accessorVar)
       acShared <- atomically $ readTVar accessorVar
       case acShared of
         SpaceUncommitted -> error "isVisible: an object may not be shared with a different space"
-        SpaceCommitted _ _ aliassesVar -> do
+        SpaceCommitted _ aliassesVar -> do
           aliassesHist <- atomically $ readTVar aliassesVar
           let aliasses = histLookup ts aliassesHist
               visible  = creator `Set.member` aliasses
