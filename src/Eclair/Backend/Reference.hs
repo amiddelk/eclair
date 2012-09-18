@@ -1,10 +1,12 @@
 -- | A reference/proof-of-concept implementation of @Eclair.Frontend@
 --   in a simplified setting, using in-memory concurrent transactions.
 
-{-# LANGUAGE TypeFamilies, GADTs #-}
+{-# LANGUAGE TypeFamilies, GADTs, EmptyDataDecls #-}
 module Eclair.Backend.Reference where
 
+import Control.Applicative
 import Control.Concurrent.STM
+import Control.Exception
 import Control.Monad
 import Data.HashTable(HashTable)
 import qualified Data.HashTable as HashTable
@@ -12,6 +14,9 @@ import Data.Int
 import Data.IntMap(IntMap)
 import qualified Data.IntMap as IntMap
 import Data.IORef
+import Data.List
+import Data.Map(Map)
+import qualified Data.Map as Map
 import Data.Set(Set)
 import qualified Data.Set as Set
 import Data.Unique
@@ -144,7 +149,6 @@ data SpaceShared o
       -- | The aliasses (versioned as well)
       !( TVar (AliassesHist o) )
   | SpaceUncommitted
-      !( VersionedObject o ) 
 
 -- | Ordered sequence of aliasses.
 type AliassesHist o = IntMap (Set (RSpace o))
@@ -182,8 +186,9 @@ hashRRef :: RRef o -> Int32
 hashRRef (RRef (RSpace u _)) = fromIntegral $ hashUnique u 
 
 data RTrans = RTrans
-  { txnStart   :: !Int
-  , txnPublish :: !( HashTable AnyRef RootObject )
+  { txnStartTime   :: !TS
+  , txnCommitTime  :: !( TVar (Maybe TS) )
+  , txnPublish     :: !( HashTable AnyRef RootObject )
   }
 
 -- | A root object of a space, of which the actual type is hidden (existential).
@@ -195,12 +200,76 @@ instance IsStore RStore where
   type Trans RStore = RTrans
 
   openTransaction  s = do 
-    ts <- readClock s
+    ts  <- readClock s
+    var <- newTVarIO Nothing
     updates <- HashTable.new (==) hashRRef
-    return $ RTrans {txnStart = ts, txnPublish = updates}
+    return $ RTrans
+      { txnStartTime  = ts
+      , txnCommitTime = var
+      , txnPublish    = updates
+      }
 
   abortTransaction _ _ = return ()
-  commitTransaction = undefined
+
+  commitTransaction s txn = do
+    -- obtain the spaces to commit (ordered)
+    published0 <- HashTable.toList $ txnPublish txn
+    let comparePublish (a,_) (b,_) = compare a b
+        published = sortBy comparePublish $ published0
+
+    -- get exclusive access to spaces
+    let recoverSpaces = atomically . mapM_ recoverSpace
+        recoverSpace (PubCommitted _ hist histVar _) = do
+          restoreNeeded <- isEmptyTMVar histVar
+          when restoreNeeded $ putTMVar histVar hist
+        recoverSpace _ = return ()
+        grabSpaces = atomically $ forM published $ grabSpace
+
+        grabSpace :: (AnyRef, RootObject) -> STM PublishInfo
+        grabSpace (ref, root) =
+          case ref of
+            RRef (RSpace _ stateVar) -> do
+              state <- readTVar stateVar
+              return (undefined, root)
+              case state of
+                SpaceUncommitted -> do
+                  -- uncommitted, thus already exclusive to txn
+                  return $ PubUncommitted ref stateVar root
+                SpaceCommitted histVar _ -> do
+                  hist <- takeTMVar histVar
+                  return $ PubCommitted ref hist histVar root
+
+    bracketOnError grabSpaces recoverSpaces $ \pubs -> do
+      -- incr+get commit time
+      ts <- incrementClock s
+      atomically $ writeTVar (txnCommitTime txn) $! Just ts
+
+      let -- if committed: update the root to the current state of the space
+          -- if uncommitted: register the update nodes with the space
+          processSpace :: PublishInfo -> IO ()
+          processSpace (PubUncommitted (RRef spUntyped) spaceVarUntyped (SomeRoot patch)) = do
+            let sp       = unsafeCoerce spUntyped
+                spaceVar = unsafeCoerce spaceVarUntyped
+            registerSpace sp ts patch
+            shared <- initializeSpace ts patch
+            atomically $ writeTVar spaceVar shared
+          processSpace (PubCommitted refUntyped@(RRef spUntyped) histUntyped histVarUntyped (SomeRoot patch)) = do
+            -- go from the "whatever" type to the type of patch
+            let histVar = unsafeCoerce histVarUntyped
+                hist    = unsafeCoerce histUntyped
+                ref     = unsafeCoerce refUntyped
+                sp      = unsafeCoerce spUntyped
+                current = histLookup ts hist
+            patch' <- joinRoots s txn ref patch current
+            let hist' = histInsert ts patch' hist
+            atomically $ putTMVar histVar hist'
+
+      -- process and release the spaces one by one
+      forM_ pubs processSpace
+
+data PublishInfo
+  = PubUncommitted  !AnyRef !(TVar (SpaceShared Whatever))  !RootObject
+  | PubCommitted    !AnyRef !(ObjHist Whatever)  !(TMVar (ObjHist Whatever))  !RootObject
 
  
 -- | Initializes the store.
@@ -232,8 +301,10 @@ readClock s =
     return t
 
 
-instance IsRoot (VersionedObject o) where
+class VersionedJoin o where
+  joinObjects :: TS -> RSpace o -> VersionedObject o -> VersionedObject o -> IO (VersionedObject o)
 
+instance VersionedJoin o => IsRoot (VersionedObject o) where
   accessSpace s txn ref = do
     -- find a locally updated version, if any.
     mbLocal <- lookupLocal txn ref
@@ -245,15 +316,19 @@ instance IsRoot (VersionedObject o) where
           RRef space -> lookupSpace txn space
 
   allocSpace s txn obj = do
-    spaceVar <- newTVarIO $! SpaceUncommitted obj
+    spaceVar <- newTVarIO $ SpaceUncommitted
     u <- newUnique
     let space = RSpace u spaceVar
         ref   = RRef $! space
-    registerPublish txn ref obj 
+    registerPublish txn ref obj
     return ref
 
   updateSpace s txn ref obj =
     registerPublish txn ref obj
+
+  joinRoots _ txn (RRef space) new current = do
+    Just ts <- atomically $ readTVar $ txnCommitTime txn
+    joinObjects ts space new current
 
 -- | The history must contain a mapping with
 --   a key smaller or equal to the @ts@.
@@ -264,6 +339,10 @@ histLookup ts hist =
       case mbObj of
         Nothing  -> snd $ IntMap.findMax smaller
         Just obj -> obj
+
+-- | Adds a pair ts obj to the history
+histInsert :: TS -> t -> IntMap t -> IntMap t
+histInsert = IntMap.insert
 
 -- | Finds the locally published contents of a space, if any.
 lookupLocal :: RTrans -> RRef (VersionedObject o) -> IO (Maybe (VersionedObject o))
@@ -282,12 +361,12 @@ lookupSpace txn (RSpace _ sharedVar) = do
   case content of
     SpaceCommitted histVar _ -> do
       hist <- atomically $ readTMVar histVar
-      let ts = txnStart txn
+      let ts = txnStartTime txn
       return $! histLookup ts hist 
-    SpaceUncommitted obj -> return obj
+    SpaceUncommitted -> error "lookupSpace: cannot be called on an uncommitted space"
 
 -- | Registers the mapping from reference to object with the transaction.
-registerPublish :: RTrans -> RRef (VersionedObject o) -> VersionedObject o -> IO ()
+registerPublish :: (IsRoot r, r ~ VersionedObject o) => RTrans -> RRef r -> r -> IO ()
 registerPublish txn ref obj = do
   let tbl = txnPublish txn
       key = unsafeCoerce ref
@@ -296,13 +375,44 @@ registerPublish txn ref obj = do
 
 -- * Those pesky type parameters
 
-type Whatever  = () -- can be coerced (unsafely) to any value
-type AnyRef    = RRef Whatever
+data Whatever :: *
+type AnyRef    = RRef AnyObject
 type AnyObject = VersionedObject Whatever
 
--- type SomeSpace  = InMemorySpace WhateverValue
--- type SomeRef    = InMemoryRef WhateverValue
--- type SomeObject = InMemoryObject WhateverValue
+
+-- * Space functionality
+
+initializeSpace :: TS -> VersionedObject o -> IO (SpaceShared o)
+initializeSpace ts obj = do
+  let objHist = IntMap.singleton ts obj
+  let aliasHist = IntMap.empty
+  objVar   <- newTMVarIO objHist
+  aliasVar <- newTVarIO aliasHist
+  let shared = SpaceCommitted objVar aliasVar
+  return shared
+
+-- | Transforms the states of the versioned objects so
+--   that these go from unlinked to committed.
+--   Precondition: unique ownershop of the versioned
+--   object chain.
+registerSpace :: RSpace o -> TS -> VersionedObject o -> IO ()
+registerSpace sp ts (VersionedObject _ var) = do
+  node <- atomically $ readTVar var
+
+  let register base f =
+        case base of
+          Unlinked prev -> do
+            histVar <- newTVarIO $! IntMap.singleton ts prev
+            let base' = Committed sp histVar
+                node' = f base'
+            atomically $ writeTVar var $! node'
+            registerSpace sp ts prev            
+          _             -> return ()
+          
+
+  case node of
+    Join p b   -> register b (Join p)
+    Update u b -> register b (Update u)
 
 
 -- * Traversal of updates
@@ -372,7 +482,7 @@ isVisible ts creator@(RSpace crUnq _) (RSpace acUnq accessorVar)
   | otherwise      = do
       acShared <- atomically $ readTVar accessorVar
       case acShared of
-        SpaceUncommitted _ -> error "isVisible: an object may not be shared with a different space"
+        SpaceUncommitted -> error "isVisible: an object may not be shared with a different space"
         SpaceCommitted _ aliassesVar -> do
           aliassesHist <- atomically $ readTVar aliassesVar
           let aliasses = histLookup ts aliassesHist

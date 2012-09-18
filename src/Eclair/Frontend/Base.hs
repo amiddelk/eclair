@@ -4,9 +4,8 @@ module Eclair.Frontend.Base
   , Ctx, ctxStore, ctxTrans
   , IsStore, Trans, Ref
   , openTransaction, abortTransaction, commitTransaction
-  , accessSpace, allocSpace, updateSpace
   , onTransactionRestart
-  , IsRoot
+  , IsRoot, joinRoots, accessSpace, allocSpace, updateSpace
   , IsObj
   , ObjStore, ObjType, Obj, ObjRef
   , objValue, objCtx, wrapRef
@@ -109,8 +108,8 @@ class IsObj o => IsRoot o where
   -- | Stores the object @o@ (in the given snapshot) as root in the space identified by the reference.
   updateSpace :: (IsStore s, s ~ ObjStore o) => s -> Trans s -> Ref s o -> o -> IO ()
 
-  -- | Merges the contents of two spaces.
-  -- joinRoots :: o -> o -> IO o
+  -- | Updates the root of an older snapshot with the current root
+  joinRoots :: (IsStore s, s ~ ObjStore o) => s -> Trans s -> Ref s o -> o -> o -> IO o
 
 
 -- | An object is a sharable node in the data-graph of a memory
