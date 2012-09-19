@@ -193,6 +193,7 @@ data RTrans = RTrans
   , txnCommitTime   :: !( TVar (Maybe TS) )
   , txnPublish      :: !( HashTable AnyRef RootObject )
   , txnPayloadCache :: !( HashTable AnyObject AnyPayload )
+  , txnJoinMemo     :: !JoinMemo
   }
 
 -- | A root object of a space, of which the actual type is hidden (existential).
@@ -208,11 +209,13 @@ instance IsStore RStore where
     var      <- newTVarIO Nothing
     updates  <- HashTable.new (==) hashRRef
     payloads <- HashTable.new (==) hashVersionedObject
+    joinMemo <- joinMemoInitialize
     return $ RTrans
       { txnStartTime    = ts
       , txnCommitTime   = var
       , txnPublish      = updates
       , txnPayloadCache = payloads
+      , txnJoinMemo     = joinMemo
       }
 
   abortTransaction _ _ = return ()
@@ -254,18 +257,18 @@ instance IsStore RStore where
           -- if uncommitted: register the update nodes with the space
           processSpace :: PublishInfo -> IO ()
           processSpace (PubUncommitted refUntyped@(RRef spUntyped) spaceVarUntyped (SomeRoot patch)) = do
-            let sp       = unsafeCoerce spUntyped
-                spaceVar = unsafeCoerce spaceVarUntyped
-                ref      = unsafeCoerce refUntyped
+            let sp       = coerceFromAny spUntyped
+                spaceVar = coerceFromAny' spaceVarUntyped
+                ref      = coerceFromAnyObj refUntyped
             patch' <- joinRoots s txn ref patch Nothing
             shared <- initializeSpace ts sp patch'
             atomically $ writeTVar spaceVar $! shared
           processSpace (PubCommitted refUntyped@(RRef spUntyped) histUntyped histVarUntyped (SomeRoot patch)) = do
             -- coerce from the "whatever" type to the type of patch
-            let histVar = unsafeCoerce histVarUntyped
-                hist    = unsafeCoerce histUntyped
-                ref     = unsafeCoerce refUntyped
-                sp      = unsafeCoerce spUntyped
+            let histVar = coerceFromAny' histVarUntyped
+                hist    = coerceFromAnyObj histUntyped
+                ref     = coerceFromAnyObj refUntyped
+                sp      = coerceFromAny spUntyped
                 current = histLookup ts hist
             patch' <- joinRoots s txn ref patch $ Just current
             let hist' = histInsert ts patch' hist
@@ -315,14 +318,15 @@ data JoinInfo = JoinInfo
   , jiStore    :: !RStore
   , jiSpace    :: !AnySpace    -- the space (untyped)
   , jiTS       :: !TS          -- timestamp of the commit
-  , jiRegister :: !( forall o . IsPatch o => VersionedObject o -> IO () )
-  , jiJoin     :: !( forall o . IsPatch o => VersionedObject o -> VersionedObject o -> IO (VersionedObject o) )
+  , jiJoin     :: !( forall o . IsPatch o => VersionedObject o -> Maybe (VersionedObject o)
+                                          -> IO (VersionedObject o) )
   }
 
 -- | Defines type-specific join functions.
 class IsPatch o where
   -- | Updates the left hand side with patches of the right hand side.
-  joinPatches :: JoinInfo -> VersionedObject o -> VersionedObject o -> IO (VersionedObject o)
+  joinPatches :: JoinInfo -> VersionedObject o -> Either (Payload o) (Update o)
+                          -> VersionedObject o -> IO (VersionedObject o)
 
   -- | Registers the substructure of the object. The contents of the object is provided
   --   as either the payload or an update.
@@ -356,16 +360,11 @@ instance IsPatch o => IsRoot (VersionedObject o) where
     Just ts <- atomically $ readTVar $ txnCommitTime txn
     let info = JoinInfo
           { jiTxn      = txn, jiStore = s
-          , jiSpace    = unsafeCoerce space
+          , jiSpace    = coerceToAny space
           , jiTS       = ts
-          , jiRegister = registerSpace info
-          , jiJoin     = mergeSpace info
+          , jiJoin     = joinVersionedObjects info
           }
-
-    jiRegister info new
-    case mbCurrent of
-      Nothing      -> return new
-      Just current -> jiJoin info new current
+    jiJoin info new mbCurrent
 
 -- | The history must contain a mapping with
 --   a key smaller or equal to the @ts@.
@@ -384,12 +383,15 @@ histInsert = IntMap.insert
 -- | Finds the locally published contents of a space, if any.
 lookupLocal :: RTrans -> RRef (VersionedObject o) -> IO (Maybe (VersionedObject o))
 lookupLocal txn ref = do
-  let published = txnPublish txn
-      key       = unsafeCoerce ref
-  mbRoot <- HashTable.lookup key published
+  let published  = txnPublish txn
+      refUntyped = coerceToAnyObj ref
+  mbRoot <- HashTable.lookup published refUntyped
   case mbRoot of
-    Nothing             -> return Nothing
-    Just (SomeRoot obj) -> return $! unsafeCoerce obj
+    Nothing -> return Nothing
+    Just (SomeRoot objUntyped) ->
+      let obj   = coerceFromAny' objUntyped
+          mbObj = Just $! obj
+      in return $ mbObj
 
 -- | Finds the object in the space as observed by the given transaction.
 lookupSpace :: RTrans -> RSpace o -> IO (VersionedObject o)
@@ -405,12 +407,15 @@ lookupSpace txn (RSpace _ sharedVar) = do
 -- | Registers the mapping from reference to object with the transaction.
 registerPublish :: (IsRoot r, r ~ VersionedObject o) => RTrans -> RRef r -> r -> IO ()
 registerPublish txn ref obj = do
-  let tbl = txnPublish txn
-      key = unsafeCoerce ref
-      val = SomeRoot obj
-  void $ HashTable.update tbl key val
+  let tbl        = txnPublish txn
+      refUntyped = coerceToAnyObj ref
+      val        = SomeRoot obj
+  void $ HashTable.update tbl refUntyped val
 
 -- * Those pesky type parameters
+--
+-- The maps and tables explicitly forget type information. The following
+-- unsafe functions allow us to regain that information again.
 
 data Whatever :: *
 type AnyRef         = RRef AnyObject
@@ -419,6 +424,33 @@ type AnySpace       = RSpace Whatever
 type AnySpaceShared = SpaceShared Whatever
 type AnyObjHist     = ObjHist Whatever
 type AnyPayload     = Payload Whatever
+
+-- | Some variants of @unsafeCoerce@ that can only be used in combination
+--   with certain types, in order not to loose too much type information
+--   and keep some of the static checking.
+class AnyCoerce f where
+  coerceToAny :: f t -> f Whatever
+  coerceToAny = unsafeCoerce
+
+  coerceToAnyObj :: f (VersionedObject t) -> f (VersionedObject Whatever)
+  coerceToAnyObj = unsafeCoerce
+
+  coerceFromAny :: f Whatever -> f t
+  coerceFromAny = unsafeCoerce
+
+  coerceFromAny' :: f a -> f b
+  coerceFromAny' = unsafeCoerce
+
+  coerceFromAnyObj :: f (VersionedObject Whatever) -> f (VersionedObject t)
+  coerceFromAnyObj = unsafeCoerce
+
+instance AnyCoerce RRef
+instance AnyCoerce VersionedObject
+instance AnyCoerce RSpace
+instance AnyCoerce SpaceShared
+instance AnyCoerce IntMap
+instance AnyCoerce TMVar
+instance AnyCoerce TVar
 
 
 -- * Space functionality
@@ -431,6 +463,7 @@ initializeSpace ts sp obj = do
   aliasVar <- newTVarIO $! aliasHist
   return $ SpaceCommitted objVar aliasVar
 
+{-
 -- | Transforms the states of the versioned objects so
 --   that these go from unlinked to committed.
 --   Precondition: unique ownershop of the unlinked versioned
@@ -440,26 +473,47 @@ registerSpace info obj@(VersionedObject _ var) = do
   node <- atomically $ readTVar var
   let sp = jiSpace info
       ts = jiTS info
-      registerTail base f =
+      registerTail node base f =
         case base of
           Unlinked prev -> do
             histVar <- newTVarIO $! IntMap.singleton ts prev
             let base' = Committed sp histVar
                 node' = f base'
             atomically $ writeTVar var $! node'
+            registerSubstructure info obj node
             registerSpace info prev            
-          _             -> return ()
+          _ -> return ()
   case node of
-    Join p b   -> do
-      registerSubstructure info obj (Left p)
-      registerTail b (Join p)
-    Update u b -> do
-      registerSubstructure info obj (Right u)
-      registerTail b (Update u)
+    Join p b   -> registerTail (Left p) b (Join p)
+    Update u b -> registerTail (Right u) b (Update u)
 
 mergeSpace :: IsPatch o => JoinInfo -> VersionedObject o -> VersionedObject o -> IO (VersionedObject o)
 mergeSpace info new current = do
   error "todo: implement mergeSpace"
+-}
+
+-- | Moves the left-hand side out of the transaction, and updates it with patches
+--   of the right-hand side.
+joinVersionedObjects :: JoinInfo -> VersionedObject o -> Maybe (VersionedObject o) -> IO (VersionedObject o)
+joinVersionedObjects info new mbCurrent = traverseNew new where
+  traverseNew (VersionedObject _ var) = do
+    node <- atomically $ readTVar var
+    case node of
+      Join p b   -> return undefined
+      Update u b -> return undefined
+
+  traverseBase base = return undefined
+    {-
+    case base of
+      Unlinked tail -> do
+      Committed sp histVar -> do
+      None -> do
+
+    jiRegister info new
+    case mbCurrent of
+      Nothing      -> return new
+      Just current -> jiJoin info new current
+     -}
 
 -- * Traversal of updates
 
@@ -532,6 +586,43 @@ isVisible ts creatorUntyped@(RSpace crUnq _) (RSpace acUnq accessorVar)
         SpaceCommitted _ aliassesVar -> do
           aliassesHist <- atomically $ readTVar aliassesVar
           let aliasses = histLookup ts aliassesHist
-              creator  = unsafeCoerce creatorUntyped
+              creator  = coerceFromAny creatorUntyped
               visible  = creator `Set.member` aliasses
           return visible
+
+
+-- * Join cache
+--
+-- The join memo is needed for preserving sharing. When a shared @VersionedObject@
+-- is joined, it may be required to unsare it, unless all shared instances are
+-- joined with the same object. This memo table will cluster those instances
+-- that can keep being shared.
+
+type JoinMemo = HashTable AnyObject (Map (Maybe AnyObject) AnyObject)
+
+joinMemoInitialize :: IO JoinMemo
+joinMemoInitialize = HashTable.new (==) hashVersionedObject
+
+joinMemoLookup :: JoinMemo -> VersionedObject o -> Maybe (VersionedObject o) -> IO (Maybe (VersionedObject o))
+joinMemoLookup tbl left mbRight = do
+  let leftUntyped    = coerceToAny left
+      mbRightUntyped = fmap coerceToAny mbRight
+  mbMap <- HashTable.lookup tbl leftUntyped
+  case mbMap of
+    Nothing -> return Nothing
+    Just mp ->
+      case Map.lookup mbRightUntyped mp of
+        Nothing         -> return Nothing
+        Just objUntyped -> do
+          let obj = coerceFromAny objUntyped
+          return $ Just $! obj
+
+-- | Assumes that the given binding does not exist yet.
+joinMemoAdd :: JoinMemo -> VersionedObject o -> Maybe (VersionedObject o) -> VersionedObject o -> IO ()
+joinMemoAdd tbl left mbRight result = do
+  let leftUntyped    = coerceToAny left
+      mbRightUntyped = fmap coerceToAny mbRight
+      resultUntyped  = coerceToAny result
+  mp <- maybe Map.empty id <$> HashTable.lookup tbl leftUntyped
+  let mp' = Map.insert mbRightUntyped resultUntyped mp
+  void $ HashTable.update tbl leftUntyped $! mp'
