@@ -29,7 +29,16 @@ import Unsafe.Coerce
 --   so that an overflow does not occur.
 type TS = Int
 
+-- | A payload is a terminator of a sequence of patches,
+--   and generally represents the 'initial pach' or
+--   'initial state'.
+--   A payload thus must appear at the end of a series
+--   of patches, but may occur interspered in the chain
+--   as well, in which case each occurrence is withness
+--   of the merge of two distinct series of patches.
 type family Payload o :: *
+
+-- | An update represents a single patch.
 type family Update o :: *
 
 
@@ -495,7 +504,26 @@ mergeSpace info new current = do
 -- | Moves the left-hand side out of the transaction, and updates it with patches
 --   of the right-hand side.
 joinVersionedObjects :: JoinInfo -> VersionedObject o -> Maybe (VersionedObject o) -> IO (VersionedObject o)
-joinVersionedObjects info new mbCurrent = traverseNew new where
+joinVersionedObjects info = joinCached where
+  joinCached left mbRight = do
+    let memo = txnJoinMemo $ jiTxn info
+    mbCached <- joinMemoLookup memo left mbRight
+    case mbCached of
+      Nothing -> do
+        joinMemoBlackhole memo left mbRight
+        res <- joinTop left mbRight
+        joinMemoAdd memo left mbRight res
+        return res
+      Just res -> return res
+
+  joinTop left mbRight = do
+    fork <- getFork info left mbRight
+    return left
+
+
+
+{-
+traverseNew new where
   traverseNew (VersionedObject _ var) = do
     node <- atomically $ readTVar var
     case node of
@@ -503,7 +531,6 @@ joinVersionedObjects info new mbCurrent = traverseNew new where
       Update u b -> return undefined
 
   traverseBase base = return undefined
-    {-
     case base of
       Unlinked tail -> do
       Committed sp histVar -> do
@@ -515,19 +542,57 @@ joinVersionedObjects info new mbCurrent = traverseNew new where
       Just current -> jiJoin info new current
      -}
 
+-- | Gets the most-resent point where two patch series fork, if any.
+getFork :: JoinInfo -> VersionedObject o -> Maybe (VersionedObject o) -> IO (Maybe (VersionedObject o))
+getFork _ _ Nothing = return Nothing
+getFork info root (Just right) = do
+  patches <- getPatchSet info right
+  getCommonPatch info root patches
+
+-- | Gets the most resent patch in a series of patches that is
+--   a member of the given set, if any.
+getCommonPatch :: JoinInfo -> VersionedObject o -> Set (VersionedObject o) -> IO (Maybe (VersionedObject o))
+getCommonPatch info root patches = do
+  let ts    = jiTS info
+      space = jiSpace info
+      f obj base _ isUnlinked
+        | obj `Set.member` patches = return $ Right $ Just $! obj
+        | otherwise =
+            case base of
+              None           -> return $ Right Nothing
+              Unlinked _     -> return $ Left True
+              Committed _ _
+                | isUnlinked -> return $ Left False
+                | otherwise  -> return $ Right Nothing
+  Right res <- foldUpdates ts space f True root
+  return res
+
+-- | Gives the set of a series of patches rooted by @root@.
+getPatchSet :: JoinInfo -> VersionedObject o -> IO (Set (VersionedObject o))
+getPatchSet info root = do
+  let ts    = jiTS info
+      space = jiSpace info
+      f obj _ _ s  = do
+        let s' = Set.insert obj s
+            r  = Left $! s'
+        return $! r
+  Left res <- foldUpdates ts space f Set.empty root
+  return res
+
+
 -- * Traversal of updates
 
 buildUpdates ::
-  TS -> RSpace o ->
-  (Either (Payload o) (Update o) -> Payload o -> IO (Payload o)) ->
+  TS -> AnySpace ->
+  (VersionedObject o -> Base o ->  Either (Payload o) (Update o) -> Payload o -> IO (Payload o)) ->
   VersionedObject o -> IO (Payload o)
-buildUpdates ts accessSpace f obj = foldObject obj where
-  foldObject (VersionedObject _ nodeVar) = do
+buildUpdates ts accessSpace f root = foldObject root where
+  foldObject obj@(VersionedObject _ nodeVar) = do
     node <- atomically $ readTVar nodeVar
     case node of
       Join payload None  -> return payload
-      Join payload base  -> foldBase (f $ Left payload) base
-      Update update base -> foldBase (f $ Right update) base
+      Join payload base  -> foldBase (f obj base $ Left payload) base
+      Update update base -> foldBase (f obj base $ Right update) base
 
   foldBase g base = do
     case base of
@@ -546,19 +611,19 @@ buildUpdates ts accessSpace f obj = foldObject obj where
 --   where returning @Right b@ causes the scan to stop
 --   with the result @b@.
 foldUpdates ::
-  TS -> RSpace o ->
-  (Either (Payload o) (Update o) -> a -> IO (Either a a)) -> a ->
-  VersionedObject o -> IO a
-foldUpdates ts accessSpace f initv obj = foldObject obj initv where
-  foldObject (VersionedObject _ nodeVar) a = do
+  TS -> AnySpace ->
+  (VersionedObject o -> Base o -> Either (Payload o) (Update o) -> a -> IO (Either a b)) -> a ->
+  VersionedObject o -> IO (Either a b)
+foldUpdates ts accessSpace f initv root = foldObject root initv where
+  foldObject obj@(VersionedObject _ nodeVar) a = do
     node <- atomically $ readTVar nodeVar
     case node of
-      Join payload base  -> foldBase (f $ Left payload) base a
-      Update update base -> foldBase (f $ Right update) base a
+      Join payload base  -> foldBase (f obj base $ Left payload) base a
+      Update update base -> foldBase (f obj base $ Right update) base a
 
   foldBase g base a = do
     case base of
-      None         -> either id id `fmap` g a
+      None         -> g a
       Unlinked obj -> step (g a) (foldObject obj)
       Committed creationSpace histVar -> do
         visible <- isVisible ts creationSpace accessSpace
@@ -571,13 +636,13 @@ foldUpdates ts accessSpace f initv obj = foldObject obj initv where
   step m k = do
     res <- m
     case res of
-      Left a'  -> k a'
-      Right a' -> return a'
+      Left a' -> k a'
+      Right _ -> return res
 
 -- | Checks if the creator-space is a visible alias of the
 --   accessor-space.
-isVisible :: TS -> AnySpace -> RSpace o -> IO Bool
-isVisible ts creatorUntyped@(RSpace crUnq _) (RSpace acUnq accessorVar)
+isVisible :: TS -> AnySpace -> AnySpace -> IO Bool
+isVisible ts creator@(RSpace crUnq _) (RSpace acUnq accessorVar)
   | crUnq == acUnq = return True
   | otherwise      = do
       acShared <- atomically $ readTVar accessorVar
@@ -586,7 +651,6 @@ isVisible ts creatorUntyped@(RSpace crUnq _) (RSpace acUnq accessorVar)
         SpaceCommitted _ aliassesVar -> do
           aliassesHist <- atomically $ readTVar aliassesVar
           let aliasses = histLookup ts aliassesHist
-              creator  = coerceFromAny creatorUntyped
               visible  = creator `Set.member` aliasses
           return visible
 
@@ -598,24 +662,22 @@ isVisible ts creatorUntyped@(RSpace crUnq _) (RSpace acUnq accessorVar)
 -- joined with the same object. This memo table will cluster those instances
 -- that can keep being shared.
 
-type JoinMemo = HashTable AnyObject (Map (Maybe AnyObject) AnyObject)
+type JoinMemo = HashTable AnyObject JoinMemoMap
+type JoinMemoMap = Map (Maybe AnyObject) (Maybe AnyObject)
 
 joinMemoInitialize :: IO JoinMemo
 joinMemoInitialize = HashTable.new (==) hashVersionedObject
 
 joinMemoLookup :: JoinMemo -> VersionedObject o -> Maybe (VersionedObject o) -> IO (Maybe (VersionedObject o))
 joinMemoLookup tbl left mbRight = do
-  let leftUntyped    = coerceToAny left
-      mbRightUntyped = fmap coerceToAny mbRight
-  mbMap <- HashTable.lookup tbl leftUntyped
-  case mbMap of
-    Nothing -> return Nothing
-    Just mp ->
-      case Map.lookup mbRightUntyped mp of
-        Nothing         -> return Nothing
-        Just objUntyped -> do
-          let obj = coerceFromAny objUntyped
-          return $ Just $! obj
+  let mbRightUntyped = fmap coerceToAny mbRight
+  mp <- joinMemoLookupMap tbl left
+  case Map.lookup mbRightUntyped mp of
+    Nothing                  -> return Nothing
+    Just Nothing             -> throwIO $ ErrorCall "joinMemoLookup: cyle in object graph"
+    Just (Just objUntyped) -> do
+      let obj = coerceFromAny objUntyped
+      return $ Just $! obj
 
 -- | Assumes that the given binding does not exist yet.
 joinMemoAdd :: JoinMemo -> VersionedObject o -> Maybe (VersionedObject o) -> VersionedObject o -> IO ()
@@ -623,6 +685,21 @@ joinMemoAdd tbl left mbRight result = do
   let leftUntyped    = coerceToAny left
       mbRightUntyped = fmap coerceToAny mbRight
       resultUntyped  = coerceToAny result
-  mp <- maybe Map.empty id <$> HashTable.lookup tbl leftUntyped
-  let mp' = Map.insert mbRightUntyped resultUntyped mp
+  mp <- joinMemoLookupMap tbl left
+  let entry = Just $! resultUntyped
+  evaluate entry
+  let mp'   = Map.insert mbRightUntyped entry mp
+  void $ HashTable.update tbl leftUntyped $! mp'
+
+joinMemoLookupMap :: JoinMemo -> VersionedObject o -> IO JoinMemoMap
+joinMemoLookupMap tbl left = do
+  let leftUntyped    = coerceToAny left
+  maybe Map.empty id <$> HashTable.lookup tbl leftUntyped
+
+joinMemoBlackhole :: JoinMemo -> VersionedObject o -> Maybe (VersionedObject o) -> IO ()
+joinMemoBlackhole tbl left mbRight = do
+  let leftUntyped    = coerceToAny left
+      mbRightUntyped = fmap coerceToAny mbRight
+  mp <- joinMemoLookupMap tbl left
+  let mp' = Map.insert mbRightUntyped Nothing mp
   void $ HashTable.update tbl leftUntyped $! mp'
