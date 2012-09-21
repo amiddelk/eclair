@@ -517,10 +517,32 @@ joinVersionedObjects info = joinCached where
       Just res -> return res
 
   joinTop left mbRight = do
-    fork <- getFork info left mbRight
-    return left
+    mbFork <- getFork info left mbRight
+    let ts = jiTS info
+        sp = jiSpace info
 
+    -- foldUpdates is a left-fold, we turn it
+    -- into a right fold by building a function
+    -- with it that goes from right-to-left.
+    Right res <- foldUpdates ts sp (step mbFork mbRight) return left
+    return res
 
+  step (Just fork) (Just right) obj _ _ prefixM
+    | fork == obj = do
+        res <- prefixM right
+        return $ Right $! res
+  step _ mbRight obj base contents prefixM = do
+    return $ Left $ prefixM
+
+{-
+    acc = undefined
+    case base of
+      None -> case mbRight of
+                Nothing    -> Right $ accBase None
+                Just right -> mkBase right >>= accBase
+      
+    return $ Right $! prefixM obj
+-}
 
 {-
 traverseNew new where
