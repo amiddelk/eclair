@@ -742,14 +742,11 @@ instance Num a => HasView (VersionedObject (RCounter a)) where
     performAsyncPure ctx $ \cont -> do
       let txn     = ctxTrans ctx
           mbSpace = fmap refToAnySpace mbRef
+          ts      = txnStartTime txn
           build _ _ (Left ticks) ticks0  = do
             return (ticks + ticks0)
           build _ _ (Right delta) ticks0 = do
             return (delta + ticks0)
-      mbTS <- getCommitTS txn
-      let ts = case mbTS of
-                 Nothing  -> txnStartTime txn
-                 Just ts' -> ts'
       buildUpdates ts mbSpace build vo >>= cont
 
 instance Num a => HasIncr (VersionedObject (RCounter a)) where
