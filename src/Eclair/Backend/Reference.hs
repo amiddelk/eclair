@@ -333,13 +333,14 @@ data JoinInfo = JoinInfo
 
 -- | Defines type-specific join functions.
 class IsPatch o where
-  -- | Updates the left hand side with patches of the right hand side.
-  joinPatches :: JoinInfo -> VersionedObject o -> Either (Payload o) (Update o)
-                          -> VersionedObject o -> IO (VersionedObject o)
+  -- | Makes the payload ready for move outside the transaction.
+  --   If the payload is a non-flat structure, it may need to call join-functions on its
+  --   children. The payload may be on top of another object.
+  joinPayload :: JoinInfo -> VersionedObject o -> Payload o -> Maybe (VersionedObject o) -> IO (Payload o)
 
-  -- | Registers the substructure of the object. The contents of the object is provided
-  --   as either the payload or an update.
-  registerSubstructure :: JoinInfo -> VersionedObject o -> Either (Payload o) (Update o) -> IO ()
+  -- | Makes the update ready for move outside the transaction, potentially updating it with
+  --   information from a more recent version.
+  joinUpdate  :: JoinInfo -> VersionedObject o -> Update o -> Maybe (VersionedObject o) -> IO (Update o)
 
 -- | Generic implementation for the vesioned object space given type-specific
 --   join functions.
@@ -503,7 +504,8 @@ mergeSpace info new current = do
 
 -- | Moves the left-hand side out of the transaction, and updates it with patches
 --   of the right-hand side.
-joinVersionedObjects :: JoinInfo -> VersionedObject o -> Maybe (VersionedObject o) -> IO (VersionedObject o)
+joinVersionedObjects :: IsPatch o => JoinInfo -> VersionedObject o ->
+                          Maybe (VersionedObject o) -> IO (VersionedObject o)
 joinVersionedObjects info = joinCached where
   joinCached left mbRight = do
     let memo = txnJoinMemo $ jiTxn info
@@ -528,21 +530,46 @@ joinVersionedObjects info = joinCached where
     return res
 
   step (Just fork) (Just right) obj _ _ prefixM
-    | fork == obj = do
-        res <- prefixM right
-        return $ Right $! res
-  step _ mbRight obj base contents prefixM = do
-    return $ Left $ prefixM
+    | fork == obj = prefixM right >>= stop  -- reached the fork
+  step _ mbRight obj base0 contents prefixM = do
+    let constructOnBase mbChild base = do
+          let cont node = mkObj node >>= prefixM
+              mbPrev = mbRight >> mbChild
+          case contents of
+            Left payload0  -> do
+              payload' <- joinPayload info obj payload0 mbPrev
+              cont $ Join payload' base
+            Right update0 -> do
+              update' <- joinUpdate info obj update0 mbPrev
+              cont $ Update update' base
+        constructOnChild child =
+          mkBase child >>= constructOnBase (Just child)
 
-{-
-    acc = undefined
-    case base of
-      None -> case mbRight of
-                Nothing    -> Right $ accBase None
-                Just right -> mkBase right >>= accBase
-      
-    return $ Right $! prefixM obj
--}
+    case base0 of
+      None ->  -- reached the end of the chain
+        case mbRight of
+          Nothing    -> constructOnBase Nothing None >>= stop
+          Just right -> constructOnChild right       >>= stop
+      _    -> continue constructOnChild
+
+  continue prefixM = return $ Left $! prefixM
+  stop res = return $ Right $! res
+
+  -- creates a obj with given node
+  mkObj node = do
+    u   <- newUnique
+    var <- newTVarIO node
+    let obj = VersionedObject u var
+    return obj
+
+  -- creates a fresh 'base' node with given child
+  mkBase obj = do
+    let ts   = jiTS info
+        hist = IntMap.singleton ts obj
+    var <- newTVarIO hist
+    let sp   = jiSpace info
+        base = Committed sp var
+    return $ base
 
 {-
 traverseNew new where
