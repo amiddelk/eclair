@@ -16,7 +16,13 @@ increment s r =
   transactionally s $ do
     i <- access r
     let i' = incr i
-    update r i
+    update r i'
+
+increment3 s r =
+  transactionally s $ do
+    i <- access r
+    let i' = incr $ incr $ incr $ i
+    update r i'
 
 inspect s r =
   transactionally s $ do
@@ -28,6 +34,7 @@ runGeneric s = do
   r <- createRef s 0
   increment s r
   increment s r
+  increment3 s r
   v <- inspect s r
   putStrLn ("v: " ++ show v)
 

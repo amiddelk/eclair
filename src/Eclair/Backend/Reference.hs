@@ -263,7 +263,6 @@ instance IsStore RStore where
             shared <- initializeSpace ts sp patch'
             atomically $ writeTVar spaceVar $! shared
           processSpace (PubCommitted refUntyped@(RRef spUntyped) histUntyped histVarUntyped (SomeRoot patch)) = do
-            -- coerce from the "whatever" type to the type of patch
             let histVar = coerceFromAny' histVarUntyped
                 hist    = coerceFromAnyObj histUntyped
                 ref     = coerceFromAnyObj refUntyped
@@ -369,7 +368,7 @@ instance IsPatch o => IsRoot (VersionedObject o) where
     registerPublish txn ref obj
 
   joinRoots s txn (RRef space) new mbCurrent = do
-    ts <- getCommitTS txn
+    Just ts <- getCommitTS txn
     let info = JoinInfo
           { jiTxn      = txn, jiStore = s
           , jiSpace    = coerceToAny space
@@ -378,10 +377,8 @@ instance IsPatch o => IsRoot (VersionedObject o) where
           }
     jiJoin info new mbCurrent
 
-getCommitTS :: RTrans -> IO TS
-getCommitTS txn = do
-  Just ts <- atomically $ readTVar $ txnCommitTime txn
-  return ts
+getCommitTS :: RTrans -> IO (Maybe TS)
+getCommitTS txn = atomically $ readTVar $ txnCommitTime txn
 
 -- | The history must contain a mapping with
 --   a key smaller or equal to the @ts@.
@@ -500,7 +497,6 @@ joinVersionedObjects info = joinCached where
     mbFork <- getFork info left mbRight
     let ts = jiTS info
         sp = jiSpace info
-
     -- foldUpdates is a left-fold, we turn it
     -- into a right fold by building a function
     -- with it that goes from right-to-left.
@@ -555,7 +551,7 @@ getCommonPatch :: JoinInfo -> VersionedObject o -> Set (VersionedObject o) -> IO
 getCommonPatch info root patches = do
   let ts    = jiTS info
       space = jiSpace info
-      f obj base _ isUnlinked
+      step obj base _ isUnlinked
         | obj `Set.member` patches = return $ Right $ Just $! obj
         | otherwise =
             case base of
@@ -564,7 +560,7 @@ getCommonPatch info root patches = do
               Committed _ _
                 | isUnlinked -> return $ Left False
                 | otherwise  -> return $ Right Nothing
-  Right res <- foldUpdates ts space f True root
+  Right res <- foldUpdates ts space step True root
   return res
 
 -- | Gives the set of a series of patches rooted by @root@.
@@ -746,9 +742,14 @@ instance Num a => HasView (VersionedObject (RCounter a)) where
     performAsyncPure ctx $ \cont -> do
       let txn     = ctxTrans ctx
           mbSpace = fmap refToAnySpace mbRef
-          build _ _ (Left ticks) ticks0  = return (ticks + ticks0)
-          build _ _ (Right delta) ticks0 = return (delta + ticks0)
-      ts <- getCommitTS txn
+          build _ _ (Left ticks) ticks0  = do
+            return (ticks + ticks0)
+          build _ _ (Right delta) ticks0 = do
+            return (delta + ticks0)
+      mbTS <- getCommitTS txn
+      let ts = case mbTS of
+                 Nothing  -> txnStartTime txn
+                 Just ts' -> ts'
       buildUpdates ts mbSpace build vo >>= cont
 
 instance Num a => HasIncr (VersionedObject (RCounter a)) where
