@@ -9,7 +9,7 @@ import Eclair.Backend.Reference
 createRef s v =
   transactionally s $ do
     ctx <- getCtx
-    let obj = wrap ctx TSharedInt v
+    let obj = wrap ctx TCounterInt v
     create obj
 
 increment s r =
@@ -31,17 +31,7 @@ runGeneric s = do
   v <- inspect s r
   putStrLn ("v: " ++ show v)
 
-
-{-
-newtype RSharedInt = RSharedInt ()
-instance IsObj RSharedInt where
-  type ObjStore RSharedInt = RStore
-  type ObjType RSharedInt = Int
-
-type instance ObjFam (TSharedInt t) RStore = RSharedInt
-
 run :: IO ()
 run = do
   s <- initStore
   runGeneric s
--}

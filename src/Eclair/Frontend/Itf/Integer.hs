@@ -4,19 +4,17 @@ module Eclair.Frontend.Itf.Integer where
 import Eclair.Frontend.Base
 import Eclair.Frontend.Itf.Base
 
--- | Interface for incrementable objects.
+-- | Interface for incrementable objects (a.k.a. counters).
 class IsObj o => HasIncr o where
   incr :: (IsStore s, ObjStore o ~ s) => Obj o -> Obj o
 
 
--- | Interface of an Int object.
-class (HasIncr o, HasWrap o, HasView o) => IsInt o where
-  intTypeDict :: ObjTypeDict o Int
-
-instance (ObjType o ~ Int, HasIncr o, HasWrap o, HasView o) => IsInt o where
-  intTypeDict = ObjTypeDict
+-- | Interface of a counter object.
+class (HasIncr o, HasWrap o, HasView o) => IsCounter o
+instance (Num a, ObjType o ~ a, HasIncr o, HasWrap o, HasView o) => IsCounter o
 
 -- type index for shared integers
-data TSharedInt t where
-  TSharedInt :: TSharedInt Int
-
+data TCounter t where
+  TCounter        :: TCounter t
+  TCounterInt     :: TCounter Int
+  TCounterInteger :: TCounter Integer

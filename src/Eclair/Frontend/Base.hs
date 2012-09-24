@@ -8,8 +8,8 @@ module Eclair.Frontend.Base
   , IsRoot, joinRoots
   , accessSpace, allocSpace, updateSpace
   , IsObj
-  , ObjStore, ObjType, Obj, ObjRef
-  , objValue, objCtx, wrapRef
+  , ObjStore, ObjType, Obj(Obj), ObjRef
+  , objValue, objCtx, objRef, wrapRef
   , TxnResult, NF(NF), exportResult
   , TransactionRestart(RequireRestart)
   , transactionally, performAsyncPure
@@ -255,11 +255,13 @@ performAsync ctx f = do
   takeMVar var
 
 -- | Wraps a backend object @o@ into a frontend object @Obj o@.
+--   objects belonging to committed spaces should have the @mbRef@
+--   set to their space.
 wrapObj :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Maybe (Ref s o) -> o -> Obj o
-wrapObj ctx ref o = Obj
+wrapObj ctx mbRef o = Obj
   { objValue = o
   , objCtx   = ctx
-  , objRef   = ref
+  , objRef   = mbRef
   }
 
 -- | Wraps a backend reference into a frontend reference.

@@ -1,7 +1,7 @@
 -- | A reference/proof-of-concept implementation of @Eclair.Frontend@
 --   in a simplified setting, using in-memory concurrent transactions.
 
-{-# LANGUAGE TypeFamilies, GADTs, EmptyDataDecls, Rank2Types #-}
+{-# LANGUAGE TypeFamilies, GADTs, EmptyDataDecls, Rank2Types, FlexibleInstances #-}
 module Eclair.Backend.Reference where
 
 import Control.Applicative
@@ -28,19 +28,6 @@ import Unsafe.Coerce
 --   Under the assumption that the timestamps are large enough
 --   so that an overflow does not occur.
 type TS = Int
-
--- | A payload is a terminator of a sequence of patches,
---   and generally represents the 'initial pach' or
---   'initial state'.
---   A payload thus must appear at the end of a series
---   of patches, but may occur interspered in the chain
---   as well, in which case each occurrence is withness
---   of the merge of two distinct series of patches.
-type family Payload o :: *
-
--- | An update represents a single patch.
-type family Update o :: *
-
 
 -- | A versioned object is a mutable node in chains of
 --   updates with a unique identity.
@@ -195,7 +182,10 @@ instance Show (RRef o) where
   show (RRef a) = "ref:" ++ show a
 
 hashRRef :: RRef o -> Int32
-hashRRef (RRef (RSpace u _)) = fromIntegral $ hashUnique u 
+hashRRef (RRef (RSpace u _)) = fromIntegral $ hashUnique u
+
+refToAnySpace :: RRef o -> AnySpace
+refToAnySpace (RRef sp) = coerceToAny sp
 
 data RTrans = RTrans
   { txnStartTime    :: !TS
@@ -333,6 +323,18 @@ data JoinInfo = JoinInfo
 
 -- | Defines type-specific join functions.
 class IsPatch o where
+  -- | A payload is a terminator of a sequence of patches,
+  --   and generally represents the 'initial pach' or
+  --   'initial state'.
+  --   A payload thus must appear at the end of a series
+  --   of patches, but may occur interspered in the chain
+  --   as well, in which case each occurrence is withness
+  --   of the merge of two distinct series of patches.
+  type Payload o :: *
+
+  -- | An update represents a single patch.
+  type Update o :: *
+
   -- | Makes the payload ready for move outside the transaction.
   --   If the payload is a non-flat structure, it may need to call join-functions on its
   --   children. The payload may be on top of another object.
@@ -367,7 +369,7 @@ instance IsPatch o => IsRoot (VersionedObject o) where
     registerPublish txn ref obj
 
   joinRoots s txn (RRef space) new mbCurrent = do
-    Just ts <- atomically $ readTVar $ txnCommitTime txn
+    ts <- getCommitTS txn
     let info = JoinInfo
           { jiTxn      = txn, jiStore = s
           , jiSpace    = coerceToAny space
@@ -375,6 +377,11 @@ instance IsPatch o => IsRoot (VersionedObject o) where
           , jiJoin     = joinVersionedObjects info
           }
     jiJoin info new mbCurrent
+
+getCommitTS :: RTrans -> IO TS
+getCommitTS txn = do
+  Just ts <- atomically $ readTVar $ txnCommitTime txn
+  return ts
 
 -- | The history must contain a mapping with
 --   a key smaller or equal to the @ts@.
@@ -473,35 +480,6 @@ initializeSpace ts sp obj = do
   aliasVar <- newTVarIO $! aliasHist
   return $ SpaceCommitted objVar aliasVar
 
-{-
--- | Transforms the states of the versioned objects so
---   that these go from unlinked to committed.
---   Precondition: unique ownershop of the unlinked versioned
---   object chain.
-registerSpace :: IsPatch o => JoinInfo -> VersionedObject o -> IO ()
-registerSpace info obj@(VersionedObject _ var) = do
-  node <- atomically $ readTVar var
-  let sp = jiSpace info
-      ts = jiTS info
-      registerTail node base f =
-        case base of
-          Unlinked prev -> do
-            histVar <- newTVarIO $! IntMap.singleton ts prev
-            let base' = Committed sp histVar
-                node' = f base'
-            atomically $ writeTVar var $! node'
-            registerSubstructure info obj node
-            registerSpace info prev            
-          _ -> return ()
-  case node of
-    Join p b   -> registerTail (Left p) b (Join p)
-    Update u b -> registerTail (Right u) b (Update u)
-
-mergeSpace :: IsPatch o => JoinInfo -> VersionedObject o -> VersionedObject o -> IO (VersionedObject o)
-mergeSpace info new current = do
-  error "todo: implement mergeSpace"
--}
-
 -- | Moves the left-hand side out of the transaction, and updates it with patches
 --   of the right-hand side.
 joinVersionedObjects :: IsPatch o => JoinInfo -> VersionedObject o ->
@@ -533,7 +511,7 @@ joinVersionedObjects info = joinCached where
     | fork == obj = prefixM right >>= stop  -- reached the fork
   step _ mbRight obj base0 contents prefixM = do
     let constructOnBase mbChild base = do
-          let cont node = mkObj node >>= prefixM
+          let cont node = mkVersionedObject node >>= prefixM
               mbPrev = mbRight >> mbChild
           case contents of
             Left payload0  -> do
@@ -555,13 +533,6 @@ joinVersionedObjects info = joinCached where
   continue prefixM = return $ Left $! prefixM
   stop res = return $ Right $! res
 
-  -- creates a obj with given node
-  mkObj node = do
-    u   <- newUnique
-    var <- newTVarIO node
-    let obj = VersionedObject u var
-    return obj
-
   -- creates a fresh 'base' node with given child
   mkBase obj = do
     let ts   = jiTS info
@@ -570,26 +541,6 @@ joinVersionedObjects info = joinCached where
     let sp   = jiSpace info
         base = Committed sp var
     return $ base
-
-{-
-traverseNew new where
-  traverseNew (VersionedObject _ var) = do
-    node <- atomically $ readTVar var
-    case node of
-      Join p b   -> return undefined
-      Update u b -> return undefined
-
-  traverseBase base = return undefined
-    case base of
-      Unlinked tail -> do
-      Committed sp histVar -> do
-      None -> do
-
-    jiRegister info new
-    case mbCurrent of
-      Nothing      -> return new
-      Just current -> jiJoin info new current
-     -}
 
 -- | Gets the most-resent point where two patch series fork, if any.
 getFork :: JoinInfo -> VersionedObject o -> Maybe (VersionedObject o) -> IO (Maybe (VersionedObject o))
@@ -628,14 +579,30 @@ getPatchSet info root = do
   Left res <- foldUpdates ts space f Set.empty root
   return res
 
+-- | Turns a node into a versiond object.
+mkVersionedObject :: Node o -> IO (VersionedObject o)
+mkVersionedObject node = do
+  u   <- newUnique
+  var <- newTVarIO node
+  return $ VersionedObject u var
+
+-- | Wraps the payload as a starting point of a patch series.
+wrapPayload :: Payload o -> IO (VersionedObject o)
+wrapPayload payload = mkVersionedObject $ Join payload None
+
+-- | Create a fresh versioned object by adding an update on
+--   top of an existing one.
+addUpdateUnlinked :: VersionedObject o -> Update o -> IO (VersionedObject o)
+addUpdateUnlinked vo upd = mkVersionedObject $ Update upd $ Unlinked vo
+
 
 -- * Traversal of updates
 
 buildUpdates ::
-  TS -> AnySpace ->
+  TS -> Maybe AnySpace ->
   (VersionedObject o -> Base o ->  Either (Payload o) (Update o) -> Payload o -> IO (Payload o)) ->
   VersionedObject o -> IO (Payload o)
-buildUpdates ts accessSpace f root = foldObject root where
+buildUpdates ts mbAccessSpace f root = foldObject root where
   foldObject obj@(VersionedObject _ nodeVar) = do
     node <- atomically $ readTVar nodeVar
     case node of
@@ -647,14 +614,17 @@ buildUpdates ts accessSpace f root = foldObject root where
     case base of
       None         -> error "foldBase: encountered a NONE value"
       Unlinked obj -> foldObject obj >>= g
-      Committed creationSpace histVar -> do
-        visible <- isVisible ts creationSpace accessSpace
-        hist    <- atomically $ readTVar histVar
-        let obj = histLookup ts hist
-        payload <- foldObject obj
-        if visible
-         then g payload
-         else return payload
+      Committed creationSpace histVar ->
+        case mbAccessSpace of
+          Nothing -> error "foldBase: encountered a committed value without space"
+          Just accessSpace -> do
+            visible <- isVisible ts creationSpace accessSpace
+            hist    <- atomically $ readTVar histVar
+            let obj = histLookup ts hist
+            payload <- foldObject obj
+            if visible
+             then g payload
+             else return payload
 
 -- | folds over the updates from most-recent to older,
 --   where returning @Right b@ causes the scan to stop
@@ -752,3 +722,37 @@ joinMemoBlackhole tbl left mbRight = do
   mp <- joinMemoLookupMap tbl left
   let mp' = Map.insert mbRightUntyped Nothing mp
   void $ HashTable.update tbl leftUntyped $! mp'
+
+
+-- * Data-type specific implementations
+
+newtype RCounter a = RCounter ()
+type instance ObjFam (TCounter a) RStore = VersionedObject (RCounter a)
+
+instance Num a => IsPatch (RCounter a) where
+  type Payload (RCounter a) = a
+  type Update  (RCounter a) = a
+
+  joinPayload _ _ payload _ = return payload
+  joinUpdate  _ _ update  _ = return update
+
+instance Num a => HasWrap (VersionedObject (RCounter a)) where
+  wrap ctx _ a = performAsyncPure ctx $ \cont -> do
+    vo <- wrapPayload a
+    cont $ wrapObj ctx Nothing $! vo
+
+instance Num a => HasView (VersionedObject (RCounter a)) where
+  view (Obj { objValue = vo, objCtx = ctx, objRef = mbRef }) =
+    performAsyncPure ctx $ \cont -> do
+      let txn     = ctxTrans ctx
+          mbSpace = fmap refToAnySpace mbRef
+          build _ _ (Left ticks) ticks0  = return (ticks + ticks0)
+          build _ _ (Right delta) ticks0 = return (delta + ticks0)
+      ts <- getCommitTS txn
+      buildUpdates ts mbSpace build vo >>= cont
+
+instance Num a => HasIncr (VersionedObject (RCounter a)) where
+  incr (Obj { objValue = vo, objCtx = ctx, objRef = mbRef }) =
+    performAsyncPure ctx $ \cont -> do
+      vo' <- addUpdateUnlinked vo 1
+      cont $ wrapObj ctx mbRef $! vo'
