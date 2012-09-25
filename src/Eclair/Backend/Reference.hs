@@ -1,7 +1,7 @@
 -- | A reference/proof-of-concept implementation of @Eclair.Frontend@
 --   in a simplified setting, using in-memory concurrent transactions.
 
-{-# LANGUAGE TypeFamilies, GADTs, EmptyDataDecls, Rank2Types, FlexibleInstances #-}
+{-# LANGUAGE TypeFamilies, GADTs, EmptyDataDecls, Rank2Types, FlexibleInstances, FlexibleContexts #-}
 module Eclair.Backend.Reference where
 
 import Control.Applicative
@@ -49,7 +49,7 @@ instance Ord (VersionedObject o) where
 
 instance IsObj (VersionedObject o) where
   type ObjStore (VersionedObject o) = RStore
-  type ObjType (VersionedObject o)  = Payload o
+  type ObjType (VersionedObject o)  = External o
 
 hashVersionedObject :: VersionedObject o -> Int32
 hashVersionedObject (VersionedObject u _) = fromIntegral $ hashUnique u
@@ -65,6 +65,9 @@ hashVersionedObject (VersionedObject u _) = fromIntegral $ hashUnique u
 --   base values, then merge nodes may need to be added. Depending
 --   on the actual implementation, a merge node may simply be
 --   considered as letting its payload win over its base.
+--   TODO: think about this: if chains get rearranged, then perhaps
+--   this has consequences for the contents of a payload/update,
+--   because these may contain information computed from their tail.
 --
 --   A node value is not mutable: update the variable of the
 --   VersionedObject instead.
@@ -188,11 +191,11 @@ refToAnySpace :: RRef o -> AnySpace
 refToAnySpace (RRef sp) = coerceToAny sp
 
 data RTrans = RTrans
-  { txnStartTime    :: !TS
-  , txnCommitTime   :: !( TVar (Maybe TS) )
-  , txnPublish      :: !( HashTable AnyRef RootObject )
-  , txnPayloadCache :: !( HashTable AnyObject AnyPayload )
-  , txnJoinMemo     :: !JoinMemo
+  { txnStartTime   :: !TS
+  , txnCommitTime  :: !( TVar (Maybe TS) )
+  , txnPublish     :: !( HashTable AnyRef RootObject )
+  , txnCommitCache :: !( HashTable AnyObject AnyPayload )
+  , txnJoinMemo    :: !JoinMemo
   }
 
 -- | A root object of a space, of which the actual type is hidden (existential).
@@ -213,7 +216,7 @@ instance IsStore RStore where
       { txnStartTime    = ts
       , txnCommitTime   = var
       , txnPublish      = updates
-      , txnPayloadCache = payloads
+      , txnCommitCache  = payloads
       , txnJoinMemo     = joinMemo
       }
 
@@ -320,6 +323,23 @@ data JoinInfo = JoinInfo
                                           -> IO (VersionedObject o) )
   }
 
+data ViewInfo = ViewInfo
+  { viTxn     :: !RTrans
+  , viMbSpace :: !(Maybe AnySpace)
+  , viTS      :: !TS
+  }
+
+jiToVi :: JoinInfo -> ViewInfo
+jiToVi (JoinInfo { jiTxn = txn, jiSpace = sp, jiTS = ts }) =
+  ViewInfo { viTxn = txn, viMbSpace = Just sp, viTS = ts }
+
+objToVi :: Obj (VersionedObject o) -> ViewInfo
+objToVi (Obj { objCtx = ctx, objRef = mbRef }) = vi where
+  txn     = ctxTrans ctx
+  mbSpace = fmap refToAnySpace mbRef
+  ts      = txnStartTime txn
+  vi      = ViewInfo { viTxn = txn, viMbSpace = mbSpace, viTS = ts }
+
 -- | Defines type-specific join functions.
 class IsPatch o where
   -- | A payload is a terminator of a sequence of patches,
@@ -333,6 +353,9 @@ class IsPatch o where
 
   -- | An update represents a single patch.
   type Update o :: *
+
+  -- | The external representation of the patch.
+  type External o :: *
 
   -- | Makes the payload ready for move outside the transaction.
   --   If the payload is a non-flat structure, it may need to call join-functions on its
@@ -595,10 +618,19 @@ addUpdateUnlinked vo upd = mkVersionedObject $ Update upd $ Unlinked vo
 -- * Traversal of updates
 
 buildUpdates ::
-  TS -> Maybe AnySpace ->
+  ViewInfo ->
   (VersionedObject o -> Base o ->  Either (Payload o) (Update o) -> Payload o -> IO (Payload o)) ->
   VersionedObject o -> IO (Payload o)
-buildUpdates ts mbAccessSpace f root = foldObject root where
+buildUpdates (ViewInfo { viTxn = txn, viMbSpace = mbAccessSpace, viTS = ts }) f root = foldTop root where
+  foldTop obj = do
+    mbPayload <- payloadMemoLookup txn ts obj
+    case mbPayload of
+      Nothing -> do
+        payload <- foldObject obj
+        payloadMemoAdd txn ts obj payload
+        return payload
+      Just payload -> return payload
+
   foldObject obj@(VersionedObject _ nodeVar) = do
     node <- atomically $ readTVar nodeVar
     case node of
@@ -719,15 +751,45 @@ joinMemoBlackhole tbl left mbRight = do
   let mp' = Map.insert mbRightUntyped Nothing mp
   void $ HashTable.update tbl leftUntyped $! mp'
 
+-- * Payload cache
+--
+-- Lookups done during the transaction (which have a ts == txnStartTime) may happen
+-- concurrently.
+payloadMemoLookup :: RTrans -> TS -> VersionedObject o -> IO (Maybe (Payload o))
+payloadMemoLookup txn ts obj
+  | txnStartTime txn == ts = return Nothing
+  | otherwise = do
+      let tbl = txnCommitCache txn
+          objUntyped = coerceToAny obj
+      mbPayloadUntyped <- HashTable.lookup tbl objUntyped
+      case mbPayloadUntyped of
+        Nothing             -> return Nothing
+        Just payloadUntyped -> return $ Just $! unsafeCoerce payloadUntyped
 
--- * Data-type specific implementations
+payloadMemoAdd :: RTrans -> TS -> VersionedObject o -> Payload o -> IO ()
+payloadMemoAdd txn ts obj payload
+  | txnStartTime txn == ts = return ()
+  | otherwise = do
+      let tbl            = txnCommitCache txn
+          objUntyped     = coerceToAny obj
+          payloadUntyped = unsafeCoerce payload
+      void $ HashTable.update tbl objUntyped payloadUntyped
+
+
+-- * Implementation of indirections
+
+-- todo
+
+
+-- * Implementation of a counter
 
 newtype RCounter a = RCounter ()
 type instance ObjFam (TCounter a) RStore = VersionedObject (RCounter a)
 
 instance Num a => IsPatch (RCounter a) where
-  type Payload (RCounter a) = a
-  type Update  (RCounter a) = a
+  type Payload  (RCounter a) = a
+  type Update   (RCounter a) = a
+  type External (RCounter a) = a
 
   joinPayload _ _ payload _ = return payload
   joinUpdate  _ _ update  _ = return update
@@ -738,19 +800,96 @@ instance Num a => HasWrap (VersionedObject (RCounter a)) where
     cont $ wrapObj ctx Nothing $! vo
 
 instance Num a => HasView (VersionedObject (RCounter a)) where
-  view (Obj { objValue = vo, objCtx = ctx, objRef = mbRef }) =
+  view obj@(Obj { objValue = vo, objCtx = ctx }) =
     performAsyncPure ctx $ \cont -> do
-      let txn     = ctxTrans ctx
-          mbSpace = fmap refToAnySpace mbRef
-          ts      = txnStartTime txn
+      let vi = objToVi obj
           build _ _ (Left ticks) ticks0  = do
             return (ticks + ticks0)
           build _ _ (Right delta) ticks0 = do
             return (delta + ticks0)
-      buildUpdates ts mbSpace build vo >>= cont
+      buildUpdates vi build vo >>= cont
 
 instance Num a => HasIncr (VersionedObject (RCounter a)) where
-  incr (Obj { objValue = vo, objCtx = ctx, objRef = mbRef }) =
+  incrBy delta (Obj { objValue = vo, objCtx = ctx, objRef = mbRef }) =
     performAsyncPure ctx $ \cont -> do
-      vo' <- addUpdateUnlinked vo 1
+      vo' <- addUpdateUnlinked vo delta
       cont $ wrapObj ctx mbRef $! vo'
+
+
+-- * Implementation of a dictionary
+
+newtype RDict k v = RDict ()
+type instance ObjFam (TDict (IDict k v)) RStore = VersionedObject (RDict k v)
+
+data Entry v =
+  Entry
+    !Int        -- ^ adds - hides
+    !(Maybe v)  -- ^ the object (must be there if adds - hides > 0)
+
+-- | A left-biassed join.
+joinEntries :: Entry v -> Entry v -> Entry v
+joinEntries (Entry a mbA) (Entry b mbB) = res where
+  res = Entry (a + b) mbC
+  mbC = case mbA of
+          Nothing -> mbB
+          Just _  -> mbA
+
+data DictUpdate k v
+  = DictAdd !k !v
+  | DictHide !k
+
+-- todo: define the joinPayload in terms of joinUpdate instead of the other way around.
+instance (Ord k, IsPatch v) => IsPatch (RDict k (VersionedObject v)) where
+  type Payload (RDict k (VersionedObject v))  = Map k (Entry (VersionedObject v))
+  type Update (RDict k (VersionedObject v))   = DictUpdate k (VersionedObject v)
+  type External (RDict k (VersionedObject v)) = Map k (VersionedObject v)
+
+  joinPayload info _ payload Nothing = do
+    let new = Map.toAscList payload
+    new' <- forM new $ \(k, e@(Entry a mbVa)) ->
+      case mbVa of
+        Nothing -> return (k,e)
+        Just va -> do
+          va' <- jiJoin info va Nothing
+          let e' = Entry a $ Just $! va'
+          return (k,e')
+    let payload' = Map.fromAscList new'
+    evaluate (Map.size payload')
+    return payload'
+
+  joinPayload info _ payload (Just right) = do
+    let vi = jiToVi info
+    mp <- buildMap vi right
+    let common = Map.toAscList $ Map.intersectionWith (,) payload mp
+    merged <- forM common $ \(k,(Entry a mbVa, Entry b mbVb)) -> do
+      mbVc <- case (mbVa, mbVb) of
+                (Nothing, Nothing) -> return Nothing
+                (Just _, Nothing)  -> return mbVa
+                (Nothing, _)       -> return mbVb
+                (Just va, Just vb) -> do
+                  vc <- jiJoin info va (Just vb)
+                  return $ Just $! vc
+      let c      = a + b
+          entry' = Entry c mbVc
+      return (k, entry')
+    let mpNew = Map.fromAscList merged
+        res   = Map.union mpNew payload
+    evaluate $ Map.size res  -- force evaluation
+    return $ res
+
+  joinUpdate _ _ upd@(DictHide k) _ = return upd
+  joinUpdate info obj (DictAdd k v) mbRight = do
+    let payload = Map.singleton k $ Entry 1 (Just v)
+    mp' <- joinPayload info obj payload mbRight
+    case Map.lookup k mp' of
+      Just (Entry _ (Just v')) -> return $ DictAdd k v'
+      _ -> error "joinUpdate: key and value should be in the map"
+
+buildMap :: Ord k => ViewInfo -> VersionedObject (RDict k (VersionedObject v)) -> IO (Map k (Entry (VersionedObject v)))
+buildMap vi = buildUpdates vi f where
+  f _ _ (Left mp)   = return . Map.union mp
+  f _ _ (Right upd) = return . Map.insertWith joinEntries key entry where
+    (key, entry) =
+      case upd of
+        DictAdd k v -> (k, Entry 1 $ Just v)
+        DictHide k  -> (k, Entry (-1) Nothing)

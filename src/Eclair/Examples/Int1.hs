@@ -24,6 +24,12 @@ increment3 s r =
     let i' = incr $ incr $ incr $ i
     update r i'
 
+decrement2 s r =
+  transactionally s $ do
+    i <- access r
+    let i' = decrBy 2 i
+    update r i'
+
 inspect s r =
   transactionally s $ do
   i <- access r
@@ -31,10 +37,11 @@ inspect s r =
   return (NF v)
 
 runGeneric s = do
-  r <- createRef s 0
-  increment s r
-  increment s r
+  r <- createRef s 2
   increment3 s r
+  decrement2 s r
+  increment s r
+  increment s r
   v <- inspect s r
   putStrLn ("v: " ++ show v)
 

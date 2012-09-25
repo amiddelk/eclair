@@ -1,3 +1,10 @@
+---
+---   This file is obsolete and can be deleted.
+---
+---
+---
+
+
 -- | A reference implementation of @Eclair.Frontend@ using
 --   an in-memory database based on STM.
 
