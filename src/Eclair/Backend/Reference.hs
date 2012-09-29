@@ -776,6 +776,21 @@ payloadMemoAdd txn ts obj payload
       void $ HashTable.update tbl objUntyped payloadUntyped
 
 
+-- * Helper functions for data types
+
+unconditionallyUpdate :: Obj (VersionedObject t) -> Update t -> Obj (VersionedObject t)
+unconditionallyUpdate (Obj { objValue = vo, objCtx = ctx, objRef = mbRef }) upd =
+  performAsyncPure ctx $ \cont -> do
+    vo' <- addUpdateUnlinked vo upd
+    cont $ wrapObj ctx mbRef $! vo'
+
+unconditionallyWrap :: (IsStore s, ObjStore o ~ s, ObjFam ix s ~ o, o ~ VersionedObject t) => Ctx s -> ix -> Payload t -> Obj o
+unconditionallyWrap ctx _ a =
+  performAsyncPure ctx $ \cont -> do
+    vo <- wrapPayload a
+    cont $ wrapObj ctx Nothing $! vo
+
+
 -- * Implementation of indirections
 
 -- todo
@@ -795,9 +810,7 @@ instance Num a => IsPatch (RCounter a) where
   joinUpdate  _ _ update  _ = return update
 
 instance Num a => HasWrap (VersionedObject (RCounter a)) where
-  wrap ctx _ a = performAsyncPure ctx $ \cont -> do
-    vo <- wrapPayload a
-    cont $ wrapObj ctx Nothing $! vo
+  wrap = unconditionallyWrap
 
 instance Num a => HasView (VersionedObject (RCounter a)) where
   view obj@(Obj { objValue = vo, objCtx = ctx }) =
@@ -810,10 +823,7 @@ instance Num a => HasView (VersionedObject (RCounter a)) where
       buildUpdates vi build vo >>= cont
 
 instance Num a => HasIncr (VersionedObject (RCounter a)) where
-  incrBy delta (Obj { objValue = vo, objCtx = ctx, objRef = mbRef }) =
-    performAsyncPure ctx $ \cont -> do
-      vo' <- addUpdateUnlinked vo delta
-      cont $ wrapObj ctx mbRef $! vo'
+  incrBy delta obj = unconditionallyUpdate obj delta
 
 
 -- * Implementation of a dictionary
@@ -821,75 +831,66 @@ instance Num a => HasIncr (VersionedObject (RCounter a)) where
 newtype RDict k v = RDict ()
 type instance ObjFam (TDict (IDict k v)) RStore = VersionedObject (RDict k v)
 
-data Entry v =
-  Entry
-    !Int        -- ^ adds - hides
-    !(Maybe v)  -- ^ the object (must be there if adds - hides > 0)
-
--- | A left-biassed join.
-joinEntries :: Entry v -> Entry v -> Entry v
-joinEntries (Entry a mbA) (Entry b mbB) = res where
-  res = Entry (a + b) mbC
-  mbC = case mbA of
-          Nothing -> mbB
-          Just _  -> mbA
-
 data DictUpdate k v
-  = DictAdd !k !v
-  | DictHide !k
+  = DictUpdate !k !v
 
--- todo: define the joinPayload in terms of joinUpdate instead of the other way around.
+forceEvalMap :: Map k v -> IO ()
+forceEvalMap = void . evaluate . Map.size
+
 instance (Ord k, IsPatch v) => IsPatch (RDict k (VersionedObject v)) where
-  type Payload (RDict k (VersionedObject v))  = Map k (Entry (VersionedObject v))
+  type Payload (RDict k (VersionedObject v))  = Map k (VersionedObject v)
   type Update (RDict k (VersionedObject v))   = DictUpdate k (VersionedObject v)
   type External (RDict k (VersionedObject v)) = Map k (VersionedObject v)
 
-  joinPayload info _ payload Nothing = do
+  -- | Defined in terms of @joinUpdate@
+  joinPayload info obj payload mbRight = do
     let new = Map.toAscList payload
-    new' <- forM new $ \(k, e@(Entry a mbVa)) ->
-      case mbVa of
-        Nothing -> return (k,e)
-        Just va -> do
-          va' <- jiJoin info va Nothing
-          let e' = Entry a $ Just $! va'
-          return (k,e')
+    new' <- forM new $ \(k, a) -> do
+      DictUpdate _ a' <- joinUpdate info obj (DictUpdate k a) mbRight
+      return (k,a')
     let payload' = Map.fromAscList new'
-    evaluate (Map.size payload')
+    forceEvalMap payload'
     return payload'
 
-  joinPayload info _ payload (Just right) = do
+  joinUpdate info _ (DictUpdate k v) Nothing = do
+    v' <- jiJoin info v Nothing
+    return (DictUpdate k v')
+  joinUpdate info _ (DictUpdate k v) (Just right) = do
     let vi = jiToVi info
     mp <- buildMap vi right
-    let common = Map.toAscList $ Map.intersectionWith (,) payload mp
-    merged <- forM common $ \(k,(Entry a mbVa, Entry b mbVb)) -> do
-      mbVc <- case (mbVa, mbVb) of
-                (Nothing, Nothing) -> return Nothing
-                (Just _, Nothing)  -> return mbVa
-                (Nothing, _)       -> return mbVb
-                (Just va, Just vb) -> do
-                  vc <- jiJoin info va (Just vb)
-                  return $ Just $! vc
-      let c      = a + b
-          entry' = Entry c mbVc
-      return (k, entry')
-    let mpNew = Map.fromAscList merged
-        res   = Map.union mpNew payload
-    evaluate $ Map.size res  -- force evaluation
-    return $ res
+    let mbCurrent = Map.lookup k mp
+    v' <- jiJoin info v mbCurrent
+    return (DictUpdate k v')
 
-  joinUpdate _ _ upd@(DictHide k) _ = return upd
-  joinUpdate info obj (DictAdd k v) mbRight = do
-    let payload = Map.singleton k $ Entry 1 (Just v)
-    mp' <- joinPayload info obj payload mbRight
-    case Map.lookup k mp' of
-      Just (Entry _ (Just v')) -> return $ DictAdd k v'
-      _ -> error "joinUpdate: key and value should be in the map"
-
-buildMap :: Ord k => ViewInfo -> VersionedObject (RDict k (VersionedObject v)) -> IO (Map k (Entry (VersionedObject v)))
+buildMap :: Ord k => ViewInfo -> VersionedObject (RDict k (VersionedObject v)) -> IO (Map k (VersionedObject v))
 buildMap vi = buildUpdates vi f where
-  f _ _ (Left mp)   = return . Map.union mp
-  f _ _ (Right upd) = return . Map.insertWith joinEntries key entry where
-    (key, entry) =
-      case upd of
-        DictAdd k v -> (k, Entry 1 $ Just v)
-        DictHide k  -> (k, Entry (-1) Nothing)
+  f _ _ (Left mp) mp0 = do
+    let res = Map.union mp mp0
+    forceEvalMap res
+    return res
+  f _ _ (Right (DictUpdate k v)) mp0 = do
+    let res = Map.insert k v mp0
+    forceEvalMap res
+    return res
+
+instance IsDictObj (VersionedObject (RDict k v)) where
+  type DictKey   (VersionedObject (RDict k v)) = k
+  type DictValue (VersionedObject (RDict k v)) = Obj v
+
+instance (Ord k, IsPatch v) => HasUpdateBinding (VersionedObject (RDict k (VersionedObject v))) where
+  updateBinding k v m = unconditionallyUpdate m $ DictUpdate k $ objValue v
+
+instance (Ord k, IsPatch v) => HasWrap (VersionedObject (RDict k (VersionedObject v))) where
+  wrap = unconditionallyWrap
+
+instance (Ord k) => HasView (VersionedObject (RDict k (VersionedObject v))) where
+  view obj@(Obj { objValue = vo, objCtx = ctx }) =
+    performAsyncPure ctx $ \cont -> do
+      let vi = objToVi obj
+      buildMap vi vo >>= cont
+
+instance Ord k => HasLookup (VersionedObject (RDict k (VersionedObject v))) where
+  lookup obj@(Obj { objCtx = ctx, objRef = mbRef }) key =
+    case Map.lookup key $ view obj of
+      Nothing -> Nothing
+      Just vo -> undefined -- wrapObj ctx mbRef $! vo

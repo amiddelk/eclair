@@ -121,8 +121,7 @@ class IsObj o where
   type ObjStore o :: *  -- the associated store of the object
 
 -- | Wrapper around an object @o@ that stores some information
---   about the underlying object @o@, such as the snapshot from
---   which @o@ stems from.
+--   about the underlying object @o@.
 data Obj o = Obj
   { objValue :: !o
   , objCtx   :: !(Ctx (ObjStore o))
