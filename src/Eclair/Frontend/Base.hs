@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, DeriveDataTypeable, FlexibleInstances #-}
+{-# LANGUAGE TypeFamilies, DeriveDataTypeable, FlexibleInstances, EmptyDataDecls #-}
 module Eclair.Frontend.Base 
   ( TransactM
   , Ctx, ctxStore, ctxTrans
@@ -10,6 +10,7 @@ module Eclair.Frontend.Base
   , IsObj
   , ObjStore, ObjType, Obj(Obj), ObjRef
   , objValue, objCtx, objRef, wrapRef
+  , Whatever
   , TxnResult, NF(NF), exportResult
   , TransactionRestart(RequireRestart)
   , transactionally, performAsyncPure
@@ -29,7 +30,7 @@ import Control.Monad.Trans
 import Data.IORef
 import Data.Typeable
 import System.IO.Unsafe
-import System.Mem.Weak
+import Unsafe.Coerce
 
 
 -- *  The TransactM monad, which can be used to transactionlly perform some
@@ -125,8 +126,10 @@ class IsObj o where
 data Obj o = Obj
   { objValue :: !o
   , objCtx   :: !(Ctx (ObjStore o))
-  , objRef   :: !(Maybe (Ref (ObjStore o) o))
+  , objRef   :: !(Maybe (Ref (ObjStore o) Whatever))
   }
+
+data Whatever
 
 -- | Wrapper around a reference that can be moved out of the
 --   transaction and keeps track of the store it was created in.
@@ -256,12 +259,17 @@ performAsync ctx f = do
 -- | Wraps a backend object @o@ into a frontend object @Obj o@.
 --   objects belonging to committed spaces should have the @mbRef@
 --   set to their space.
-wrapObj :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Maybe (Ref s o) -> o -> Obj o
+wrapObj :: (IsStore s, IsObj o, ObjStore o ~ s) => Ctx s -> Maybe (Ref s o') -> o -> Obj o
 wrapObj ctx mbRef o = Obj
   { objValue = o
   , objCtx   = ctx
-  , objRef   = mbRef
+  , objRef   = case mbRef of
+                 Nothing  -> Nothing
+                 Just ref -> Just $! toAnyRef o ref
   }
+
+toAnyRef :: ObjStore o ~ s => o -> Ref s o' -> Ref s Whatever
+toAnyRef _ = unsafeCoerce
 
 -- | Wraps a backend reference into a frontend reference.
 wrapRef :: (IsObj o, IsStore s, ObjStore o ~ s) => Ctx s -> Ref s o -> ObjRef o

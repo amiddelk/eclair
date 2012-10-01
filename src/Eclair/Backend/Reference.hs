@@ -454,7 +454,6 @@ registerPublish txn ref obj = do
 -- The maps and tables explicitly forget type information. The following
 -- unsafe functions allow us to regain that information again.
 
-data Whatever :: *
 type AnyRef         = RRef AnyObject
 type AnyObject      = VersionedObject Whatever
 type AnySpace       = RSpace Whatever
@@ -893,4 +892,4 @@ instance Ord k => HasLookup (VersionedObject (RDict k (VersionedObject v))) wher
   lookup obj@(Obj { objCtx = ctx, objRef = mbRef }) key =
     case Map.lookup key $ view obj of
       Nothing -> Nothing
-      Just vo -> undefined -- wrapObj ctx mbRef $! vo
+      Just vo -> Just $! wrapObj ctx mbRef $! vo
